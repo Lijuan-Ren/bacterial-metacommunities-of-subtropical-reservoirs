@@ -1,0 +1,197 @@
+# ============================================================
+# Environmental variable comparison
+# Normality, homogeneity of variance, t-test / Wilcoxon test
+# ============================================================
+
+library(tidyverse)
+library(car)
+library(openxlsx)
+
+# -----------------------------
+# 1. Load environmental data
+# -----------------------------
+env <- read.csv("environmental_variables.csv",
+                check.names = FALSE)
+
+# Required columns:
+# SampleID, Season, TrophicState
+# plus environmental variables such as TN, TP, Chla, SD, DO, pH, Temp, etc.
+
+# Example:
+# env$Season <- factor(env$Season, levels = c("Wet", "Dry"))
+# env$TrophicState <- factor(env$TrophicState, levels = c("OMR", "ER"))
+
+# -----------------------------
+# 2. Define environmental variables
+# -----------------------------
+env_vars <- c(
+  "Temperature", "pH", "DO", "ORP", "Cond",
+  "SD", "TN", "TP", "NO2_N", "NO3_N",
+  "NH4_N", "Chla", "TSI"
+)
+
+env_vars <- intersect(env_vars, colnames(env))
+
+# -----------------------------
+# 3. Function for two-group comparison
+# -----------------------------
+compare_two_groups <- function(data, variable, group_var) {
+
+  df <- data %>%
+    select(all_of(c(variable, group_var))) %>%
+    drop_na()
+
+  colnames(df) <- c("Value", "Group")
+
+  df$Group <- as.factor(df$Group)
+
+  if (nlevels(df$Group) != 2) {
+    return(NULL)
+  }
+
+  # normality test within each group
+  normality <- df %>%
+    group_by(Group) %>%
+    summarise(
+      Shapiro_P = ifelse(n() >= 3,
+                         shapiro.test(Value)$p.value,
+                         NA_real_),
+      .groups = "drop"
+    )
+
+  normal_ok <- all(normality$Shapiro_P > 0.05, na.rm = TRUE)
+
+  # homogeneity of variance
+  levene_p <- tryCatch(
+    leveneTest(Value ~ Group, data = df)$`Pr(>F)`[1],
+    error = function(e) NA_real_
+  )
+
+  var_ok <- !is.na(levene_p) && levene_p > 0.05
+
+  # choose test
+  if (normal_ok && var_ok) {
+
+    test <- t.test(Value ~ Group,
+                   data = df,
+                   var.equal = TRUE)
+
+    test_name <- "Student t-test"
+
+  } else if (normal_ok && !var_ok) {
+
+    test <- t.test(Value ~ Group,
+                   data = df,
+                   var.equal = FALSE)
+
+    test_name <- "Welch t-test"
+
+  } else {
+
+    test <- wilcox.test(Value ~ Group,
+                        data = df,
+                        exact = FALSE)
+
+    test_name <- "Wilcoxon rank-sum test"
+  }
+
+  data.frame(
+    Variable = variable,
+    Group_variable = group_var,
+    Group1 = levels(df$Group)[1],
+    Group2 = levels(df$Group)[2],
+    N_group1 = sum(df$Group == levels(df$Group)[1]),
+    N_group2 = sum(df$Group == levels(df$Group)[2]),
+    Mean_group1 = mean(df$Value[df$Group == levels(df$Group)[1]], na.rm = TRUE),
+    Mean_group2 = mean(df$Value[df$Group == levels(df$Group)[2]], na.rm = TRUE),
+    Median_group1 = median(df$Value[df$Group == levels(df$Group)[1]], na.rm = TRUE),
+    Median_group2 = median(df$Value[df$Group == levels(df$Group)[2]], na.rm = TRUE),
+    Shapiro_P_group1 = normality$Shapiro_P[1],
+    Shapiro_P_group2 = normality$Shapiro_P[2],
+    Levene_P = levene_p,
+    Test = test_name,
+    Statistic = unname(test$statistic),
+    P_value = test$p.value,
+    Significance = ifelse(test$p.value < 0.05, "Significant", "Not significant")
+  )
+}
+
+# -----------------------------
+# 4. Compare trophic states
+# -----------------------------
+trophic_results <- bind_rows(
+  lapply(env_vars, function(v) {
+    compare_two_groups(env, v, "TrophicState")
+  })
+)
+
+# -----------------------------
+# 5. Compare seasons
+# -----------------------------
+season_results <- bind_rows(
+  lapply(env_vars, function(v) {
+    compare_two_groups(env, v, "Season")
+  })
+)
+
+# -----------------------------
+# 6. Optional: compare trophic states within each season
+# -----------------------------
+trophic_by_season <- env %>%
+  group_by(Season) %>%
+  group_modify(~ {
+    bind_rows(
+      lapply(env_vars, function(v) {
+        compare_two_groups(.x, v, "TrophicState")
+      })
+    )
+  }) %>%
+  ungroup()
+
+# -----------------------------
+# 7. Optional: compare seasons within each trophic state
+# -----------------------------
+season_by_trophic <- env %>%
+  group_by(TrophicState) %>%
+  group_modify(~ {
+    bind_rows(
+      lapply(env_vars, function(v) {
+        compare_two_groups(.x, v, "Season")
+      })
+    )
+  }) %>%
+  ungroup()
+
+# -----------------------------
+# 8. Export results
+# -----------------------------
+wb <- createWorkbook()
+
+addWorksheet(wb, "Trophic_state_tests")
+writeData(wb, "Trophic_state_tests", trophic_results)
+
+addWorksheet(wb, "Season_tests")
+writeData(wb, "Season_tests", season_results)
+
+addWorksheet(wb, "Trophic_by_season")
+writeData(wb, "Trophic_by_season", trophic_by_season)
+
+addWorksheet(wb, "Season_by_trophic")
+writeData(wb, "Season_by_trophic", season_by_trophic)
+
+saveWorkbook(
+  wb,
+  "Environmental_variable_statistical_tests.xlsx",
+  overwrite = TRUE
+)
+
+# -----------------------------
+# 9. Save CSV tables
+# -----------------------------
+write.csv(trophic_results,
+          "Environmental_tests_trophic_state.csv",
+          row.names = FALSE)
+
+write.csv(season_results,
+          "Environmental_tests_season.csv",
+          row.names = FALSE)

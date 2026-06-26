@@ -1,0 +1,283 @@
+# ============================================================
+# Environmental drivers and top 40 genus heatmap
+# envfit + FDR correction + Bray-Curtis clustering
+# ============================================================
+
+library(tidyverse)
+library(vegan)
+library(pheatmap)
+library(openxlsx)
+
+# -----------------------------
+# 1. Load data
+# -----------------------------
+otu <- read.csv("Bacteria.otu.csv",
+                row.names = 1,
+                check.names = FALSE)
+
+env <- read.csv("environmental_variables.csv",
+                check.names = FALSE)
+
+# Required metadata columns:
+# SampleID, Season, LifeType, TSI, TN, TP, Chla, DO, pH, etc.
+
+# Remove taxonomy column if present
+if ("taxa" %in% colnames(otu)) {
+  taxa <- otu$taxa
+  otu_count <- otu[, colnames(otu) != "taxa"]
+} else {
+  taxa <- NULL
+  otu_count <- otu
+}
+
+# Match samples
+shared_samples <- intersect(colnames(otu_count), env$SampleID)
+
+otu_count <- otu_count[, shared_samples]
+env <- env %>%
+  filter(SampleID %in% shared_samples) %>%
+  arrange(match(SampleID, shared_samples))
+
+otu_count <- otu_count[, env$SampleID]
+
+# -----------------------------
+# 2. Relative abundance
+# -----------------------------
+otu_rel <- sweep(otu_count, 2, colSums(otu_count), "/")
+otu_rel[is.na(otu_rel)] <- 0
+
+# vegan format: samples × OTUs
+comm <- t(otu_rel)
+
+# -----------------------------
+# 3. Ordination for envfit
+# -----------------------------
+bray_dist <- vegdist(comm, method = "bray")
+
+nmds <- metaMDS(
+  comm,
+  distance = "bray",
+  k = 2,
+  trymax = 100,
+  autotransform = FALSE
+)
+
+# -----------------------------
+# 4. Select environmental variables
+# -----------------------------
+env_vars <- c(
+  "Temperature", "pH", "DO", "ORP", "Cond",
+  "SD", "TN", "TP", "NO2_N", "NO3_N",
+  "NH4_N", "Chla", "TSI"
+)
+
+env_vars <- intersect(env_vars, colnames(env))
+
+env_fit_data <- env[, env_vars, drop = FALSE]
+
+# keep numeric variables only
+env_fit_data <- env_fit_data %>%
+  mutate(across(everything(), as.numeric))
+
+# -----------------------------
+# 5. envfit analysis
+# -----------------------------
+ef <- envfit(
+  nmds,
+  env_fit_data,
+  permutations = 999,
+  na.rm = TRUE
+)
+
+# Extract envfit results
+ef_vectors <- as.data.frame(scores(ef, display = "vectors"))
+ef_vectors$Variable <- rownames(ef_vectors)
+
+ef_stats <- data.frame(
+  Variable = names(ef$vectors$r),
+  R2 = ef$vectors$r,
+  P_value = ef$vectors$pvals
+)
+
+ef_results <- left_join(
+  ef_stats,
+  ef_vectors,
+  by = "Variable"
+) %>%
+  mutate(
+    FDR = p.adjust(P_value, method = "BH"),
+    Significance = case_when(
+      FDR < 0.001 ~ "***",
+      FDR < 0.01  ~ "**",
+      FDR < 0.05  ~ "*",
+      TRUE ~ "ns"
+    )
+  ) %>%
+  arrange(FDR)
+
+write.csv(
+  ef_results,
+  "envfit_environmental_drivers_FDR.csv",
+  row.names = FALSE
+)
+
+# -----------------------------
+# 6. Plot NMDS with envfit vectors
+# -----------------------------
+nmds_scores <- as.data.frame(scores(nmds, display = "sites"))
+nmds_scores$SampleID <- rownames(nmds_scores)
+
+nmds_scores <- left_join(nmds_scores, env, by = "SampleID")
+
+ef_sig <- ef_results %>%
+  filter(FDR < 0.05)
+
+p_envfit <- ggplot(nmds_scores,
+                   aes(x = NMDS1,
+                       y = NMDS2,
+                       color = Season,
+                       shape = LifeType)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  geom_segment(
+    data = ef_sig,
+    aes(x = 0, y = 0,
+        xend = NMDS1,
+        yend = NMDS2),
+    arrow = arrow(length = unit(0.25, "cm")),
+    inherit.aes = FALSE,
+    color = "black"
+  ) +
+  geom_text(
+    data = ef_sig,
+    aes(x = NMDS1,
+        y = NMDS2,
+        label = Variable),
+    inherit.aes = FALSE,
+    size = 3,
+    vjust = -0.5
+  ) +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +
+  labs(
+    title = "Environmental drivers of bacterial community variation",
+    x = "NMDS1",
+    y = "NMDS2"
+  )
+
+ggsave(
+  "NMDS_envfit_environmental_vectors.pdf",
+  p_envfit,
+  width = 7,
+  height = 5
+)
+
+# -----------------------------
+# 7. Parse taxonomy to genus level
+# -----------------------------
+parse_genus <- function(x) {
+  z <- unlist(strsplit(as.character(x), ";"))
+  z <- gsub("\\(.*?\\)", "", z)
+  z <- trimws(z)
+
+  if (length(z) >= 6 && z[6] != "") {
+    return(z[6])
+  } else {
+    return("Unclassified")
+  }
+}
+
+if (!is.null(taxa)) {
+  genus <- sapply(taxa, parse_genus)
+} else {
+  stop("Taxonomy column named 'taxa' is required for genus-level heatmap.")
+}
+
+# -----------------------------
+# 8. Collapse OTUs to genus level
+# -----------------------------
+genus_rel <- otu_rel %>%
+  as.data.frame() %>%
+  mutate(Genus = genus) %>%
+  group_by(Genus) %>%
+  summarise(across(everything(), sum),
+            .groups = "drop") %>%
+  column_to_rownames("Genus")
+
+# -----------------------------
+# 9. Select top 40 dominant genera
+# -----------------------------
+top40_genera <- genus_rel %>%
+  mutate(Mean_abundance = rowMeans(.)) %>%
+  arrange(desc(Mean_abundance)) %>%
+  slice_head(n = 40) %>%
+  select(-Mean_abundance)
+
+# -----------------------------
+# 10. Log transformation + Z-score normalization
+# -----------------------------
+heat_mat <- log10(top40_genera + 1e-6)
+
+# Z-score across taxa / genera
+heat_mat_z <- t(scale(t(as.matrix(heat_mat))))
+
+heat_mat_z[is.na(heat_mat_z)] <- 0
+
+# -----------------------------
+# 11. Bray-Curtis clustering
+# -----------------------------
+row_dist <- vegdist(heat_mat_z, method = "bray")
+col_dist <- vegdist(t(heat_mat_z), method = "bray")
+
+row_clust <- hclust(row_dist, method = "average")
+col_clust <- hclust(col_dist, method = "average")
+
+# sample annotation
+anno_col <- env %>%
+  select(SampleID, Season, LifeType, TSI) %>%
+  column_to_rownames("SampleID")
+
+anno_col <- anno_col[colnames(heat_mat_z), , drop = FALSE]
+
+# -----------------------------
+# 12. Draw heatmap
+# -----------------------------
+pdf("Top40_dominant_genera_heatmap.pdf",
+    width = 12,
+    height = 10)
+
+pheatmap(
+  heat_mat_z,
+  cluster_rows = row_clust,
+  cluster_cols = col_clust,
+  annotation_col = anno_col,
+  show_colnames = FALSE,
+  fontsize_row = 8,
+  color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100),
+  main = "Top 40 dominant bacterial genera"
+)
+
+dev.off()
+
+# -----------------------------
+# 13. Export heatmap matrix
+# -----------------------------
+wb <- createWorkbook()
+
+addWorksheet(wb, "envfit_results")
+writeData(wb, "envfit_results", ef_results)
+
+addWorksheet(wb, "Top40_log_Zscore")
+writeData(wb, "Top40_log_Zscore",
+          as.data.frame(heat_mat_z),
+          rowNames = TRUE)
+
+addWorksheet(wb, "Top40_relative_abundance")
+writeData(wb, "Top40_relative_abundance",
+          as.data.frame(top40_genera),
+          rowNames = TRUE)
+
+saveWorkbook(
+  wb,
+  "envfit_and_top40_heatmap_results.xlsx",
+  overwrite = TRUE
+)

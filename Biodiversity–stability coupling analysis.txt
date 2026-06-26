@@ -1,0 +1,227 @@
+# ============================================================
+# Biodiversity–stability coupling analysis
+# Regress network stability, robustness, and complexity
+# against OTU richness and Shannon diversity
+# within each trophic-state context
+# ============================================================
+
+library(tidyverse)
+library(broom)
+library(ggplot2)
+library(openxlsx)
+
+# ------------------------------------------------------------
+# Input data should contain at least:
+# SampleID, Season, LifeType, TrophicState,
+# Richness, Shannon,
+# Network_stability, Robustness, Network_complexity
+# ------------------------------------------------------------
+
+dat <- read.csv("SPIEC_EASI_site_network_metrics_alpha_diversity.csv",
+                check.names = FALSE)
+
+# optional: standardize names
+dat <- dat %>%
+  rename(
+    TrophicState = Trophic state
+  )
+
+# ------------------------------------------------------------
+# 1. Define response and predictor variables
+# ------------------------------------------------------------
+
+response_vars <- c(
+  "Network_stability",
+  "Robustness",
+  "Network_complexity"
+)
+
+diversity_vars <- c(
+  "Richness",
+  "Shannon"
+)
+
+# ------------------------------------------------------------
+# 2. GLM function
+# ------------------------------------------------------------
+
+run_biodiv_stability_glm <- function(data, response, predictor) {
+
+  formula_i <- as.formula(
+    paste(response, "~", predictor)
+  )
+
+  fit <- glm(
+    formula_i,
+    data = data,
+    family = gaussian()
+  )
+
+  model_sum <- summary(fit)
+
+  tibble(
+    Response = response,
+    Predictor = predictor,
+    Intercept = coef(fit)[1],
+    Slope = coef(fit)[2],
+    SE = model_sum$coefficients[2, 2],
+    t_value = model_sum$coefficients[2, 3],
+    P_value = model_sum$coefficients[2, 4],
+    AIC = AIC(fit),
+    R2 = 1 - deviance(fit) / fit$null.deviance
+  )
+}
+
+# ------------------------------------------------------------
+# 3. Run regressions separately for each trophic-state context
+# ------------------------------------------------------------
+
+glm_results <- dat %>%
+  filter(
+    !is.na(TrophicState),
+    !is.na(Richness),
+    !is.na(Shannon)
+  ) %>%
+  group_by(Season, LifeType, TrophicState) %>%
+  group_modify(~ {
+
+    out <- list()
+
+    for (resp in response_vars) {
+      for (pred in diversity_vars) {
+
+        sub <- .x %>%
+          filter(
+            !is.na(.data[[resp]]),
+            !is.na(.data[[pred]])
+          )
+
+        if (nrow(sub) >= 5) {
+          out[[paste(resp, pred, sep = "_")]] <-
+            run_biodiv_stability_glm(sub, resp, pred)
+        }
+      }
+    }
+
+    bind_rows(out)
+  }) %>%
+  ungroup()
+
+# ------------------------------------------------------------
+# 4. Save GLM results
+# ------------------------------------------------------------
+
+write.csv(
+  glm_results,
+  "Biodiversity_stability_coupling_GLM_results.csv",
+  row.names = FALSE
+)
+
+# ------------------------------------------------------------
+# 5. Plot biodiversity–stability relationships
+# ------------------------------------------------------------
+
+plot_data <- dat %>%
+  pivot_longer(
+    cols = all_of(response_vars),
+    names_to = "Network_metric",
+    values_to = "Network_value"
+  ) %>%
+  pivot_longer(
+    cols = all_of(diversity_vars),
+    names_to = "Diversity_metric",
+    values_to = "Diversity_value"
+  )
+
+p <- ggplot(
+  plot_data,
+  aes(x = Diversity_value,
+      y = Network_value,
+      color = TrophicState)
+) +
+  geom_point(size = 2.2, alpha = 0.75) +
+  geom_smooth(
+    method = "glm",
+    method.args = list(family = gaussian()),
+    se = TRUE,
+    linewidth = 0.9
+  ) +
+  facet_grid(
+    Network_metric ~ Diversity_metric,
+    scales = "free"
+  ) +
+  theme_bw() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    panel.grid = element_blank()
+  ) +
+  labs(
+    x = "Bacterial biodiversity",
+    y = "Network stability / robustness / complexity",
+    color = "Trophic state"
+  )
+
+ggsave(
+  "Biodiversity_stability_coupling_all.pdf",
+  p,
+  width = 10,
+  height = 8
+)
+
+# ------------------------------------------------------------
+# 6. Plot separately for each season × lifetype
+# ------------------------------------------------------------
+
+dir.create("Biodiversity_stability_coupling_plots",
+           showWarnings = FALSE)
+
+for (ss in unique(dat$Season)) {
+  for (lt in unique(dat$LifeType)) {
+
+    sub_plot <- plot_data %>%
+      filter(
+        Season == ss,
+        LifeType == lt
+      )
+
+    p_i <- ggplot(
+      sub_plot,
+      aes(x = Diversity_value,
+          y = Network_value,
+          color = TrophicState)
+    ) +
+      geom_point(size = 2.2, alpha = 0.75) +
+      geom_smooth(
+        method = "glm",
+        method.args = list(family = gaussian()),
+        se = TRUE,
+        linewidth = 0.9
+      ) +
+      facet_grid(
+        Network_metric ~ Diversity_metric,
+        scales = "free"
+      ) +
+      theme_bw() +
+      theme(
+        strip.text = element_text(face = "bold"),
+        panel.grid = element_blank()
+      ) +
+      labs(
+        title = paste(ss, lt),
+        x = "Bacterial biodiversity",
+        y = "Network stability / robustness / complexity",
+        color = "Trophic state"
+      )
+
+    ggsave(
+      filename = paste0(
+        "Biodiversity_stability_coupling_plots/",
+        "Biodiversity_stability_",
+        ss, "_", lt, ".pdf"
+      ),
+      plot = p_i,
+      width = 10,
+      height = 8
+    )
+  }
+}

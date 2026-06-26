@@ -1,0 +1,288 @@
+library(ecodist)
+library(QuantPsyc)
+library(vegan)
+library(ape)
+library(nlme)
+library(picante)
+library(abind)
+library(iCAMP)
+
+comm<-read.table("Bacteria.otu.txt",header=T, row.names=1,sep="\t")
+dim(comm)
+comm<-t(comm)
+dim(comm)
+
+
+phy<-read.tree("OTU.match.tre")
+phy
+
+
+match.phy.comm = match.phylo.comm(phy, comm)
+phy = match.phy.comm$phy  
+comm = comm[, phy$tip.label]
+dim(comm);  length(phy$tip.label)  
+
+  save.wd=tempdir() # please change to the folder you want to save the pd.big output.
+  pd.wd=paste0(save.wd,"/pdbig")
+  nworker=4 # parallel computing thread number
+  rand.time=1000 # usually use 1000 for real data.
+  
+  bin.size.limit=48 # for real data, usually use a proper number
+  # according to phylogenetic signal test or try some settings
+  # then choose the reasonable stochasticity level.
+  # our experience is 12, or 24, or 48.
+  # but for this example dataset which is too small, have to use 5.
+  
+  setwd(save.wd)
+  icamp.out=icamp.big(comm=comm,tree=phy,pd.wd=pd.wd,
+                      rand=rand.time, nworker=nworker,
+                      bin.size.limit=bin.size.limit)
+
+
+icamp.result <- icamp.out$detail$processes$CbMPDiCBraya
+icamp.result <- as.matrix(icamp.result)
+dim(icamp.result)
+write.csv(icamp.result,'icamp.result.csv', quote=F)
+
+##plot box chart of each community assembly processes (Heterogeneous.Selection, Homogeneous.Selection, Dispersal.Limitation, and Drift.and.Others), and conduct a non-parametric test 
+
+library(tidyverse)
+library(ggpubr)
+library(rstatix)
+library(multcompView)
+
+## Read data
+dat <- read.csv(
+  "pairwise_TSI_diff_iCAMP_same_trophicalstate.csv",
+  check.names = FALSE
+)
+
+## Order of trophical states
+state_order <- c(
+  "WFOM","WFE","WPOM","WPE",
+  "DFOM","DFE","DPOM","DPE"
+)
+
+## Community assembly processes
+process_cols <- c(
+  "Heterogeneous.Selection",
+  "Homogeneous.Selection",
+  "Dispersal.Limitation",
+  "Drift.and.Others"
+)
+
+## Convert to long format
+dat_long <- dat %>%
+  pivot_longer(
+    cols = all_of(process_cols),
+    names_to = "Process",
+    values_to = "Contribution"
+  ) %>%
+  mutate(
+    trophicalstate=factor(
+      trophicalstate,
+      levels=state_order
+    )
+  )
+
+###############################################################
+## Kruskal–Wallis tests
+###############################################################
+
+kw_results <- dat_long %>%
+  group_by(Process) %>%
+  kruskal_test(Contribution ~ trophicalstate)
+
+kw_results
+
+###############################################################
+## Dunn post hoc tests
+###############################################################
+
+dunn_results <- dat_long %>%
+  group_by(Process) %>%
+  dunn_test(
+    Contribution ~ trophicalstate,
+    p.adjust.method="BH"
+  )
+
+###############################################################
+## Generate significance letters
+###############################################################
+
+make_letters <- function(df){
+
+  pw <- dunn_test(
+    df,
+    Contribution ~ trophicalstate,
+    p.adjust.method="BH"
+  )
+
+  pvec <- pw$p.adj
+  names(pvec) <- paste(
+    pw$group1,
+    pw$group2,
+    sep="-"
+  )
+
+  letters <- multcompLetters(
+    pvec,
+    threshold=0.05
+  )$Letters
+
+  data.frame(
+    trophicalstate=names(letters),
+    Letters=letters
+  )
+}
+
+letters_df <-
+  dat_long %>%
+  group_split(Process) %>%
+  purrr::map_dfr(function(x){
+
+    out <- make_letters(x)
+
+    out$Process <- unique(x$Process)
+
+    ymax <-
+      x %>%
+      group_by(trophicalstate) %>%
+      summarise(
+        ymax=max(Contribution)
+      )
+
+    left_join(out,ymax)
+
+  })
+
+###############################################################
+## Colors
+###############################################################
+
+cols <- c(
+  "WFOM"="#1b9e77",
+  "WFE"="#d95f02",
+  "WPOM"="#7570b3",
+  "WPE"="#e7298a",
+  "DFOM"="#66a61e",
+  "DFE"="#e6ab02",
+  "DPOM"="#a6761d",
+  "DPE"="#666666"
+)
+
+###############################################################
+## Plot
+###############################################################
+
+p <- ggplot(
+  dat_long,
+  aes(
+    trophicalstate,
+    Contribution*100,
+    fill=trophicalstate
+  )
+)+
+
+geom_boxplot(
+  width=0.65,
+  outlier.shape=NA,
+  linewidth=0.5
+)+
+
+geom_jitter(
+  width=0.15,
+  size=1.3,
+  alpha=0.45
+)+
+
+stat_summary(
+  fun=median,
+  geom="point",
+  shape=23,
+  fill="white",
+  size=2.8
+)+
+
+geom_text(
+  data=letters_df,
+  aes(
+    x=trophicalstate,
+    y=(ymax+0.02)*100,
+    label=Letters
+  ),
+  inherit.aes=FALSE,
+  size=5,
+  fontface="bold"
+)+
+
+facet_wrap(
+  ~Process,
+  nrow=2,
+  ncol=2,
+  scales="free_y"
+)+
+
+scale_fill_manual(values=cols)+
+
+labs(
+  x=NULL,
+  y="Community assembly contribution (%)"
+)+
+
+theme_bw(base_size=13)+
+
+theme(
+  legend.position="none",
+
+  strip.background=
+    element_rect(
+      fill="grey90",
+      colour="black"
+    ),
+
+  strip.text=
+    element_text(
+      size=13,
+      face="bold"
+    ),
+
+  axis.text.x=
+    element_text(
+      angle=45,
+      hjust=1,
+      face="bold"
+    ),
+
+  panel.grid=
+    element_blank(),
+
+  panel.spacing=
+    unit(1.2,"lines")
+)
+
+p
+
+###############################################################
+## Save
+###############################################################
+
+ggsave(
+  "Assembly_process_boxplots_4panels.pdf",
+  p,
+  width=12,
+  height=8
+)
+
+ggsave(
+  "Assembly_process_boxplots_4panels.png",
+  p,
+  width=12,
+  height=8,
+  dpi=600
+)
+
+
+
+
+

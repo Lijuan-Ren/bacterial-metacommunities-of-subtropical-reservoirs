@@ -1,0 +1,176 @@
+# ============================================================
+# Visualization of SPIEC-EASI subnetworks
+# Fruchterman–Reingold layout with hub labels
+# ============================================================
+
+library(igraph)
+library(ggraph)
+library(tidyverse)
+library(ggrepel)
+
+# ------------------------------------------------------------
+# Assume SPIEC-EASI networks have already been constructed
+# and stored as igraph objects:
+#
+# network_list <- list(
+#   Wet_FL = g_wet_fl,
+#   Wet_PA = g_wet_pa,
+#   Dry_FL = g_dry_fl,
+#   Dry_PA = g_dry_pa
+# )
+#
+# Each graph should contain:
+# V(g)$OTU
+# V(g)$Genus
+# V(g)$Phylum
+# E(g)$sign  # "positive" or "negative"
+# ------------------------------------------------------------
+
+# -----------------------------
+# 1. Prepare graph attributes
+# -----------------------------
+prepare_network_for_plot <- function(g) {
+
+  V(g)$Degree <- degree(g)
+
+  if (is.null(V(g)$OTU)) {
+    V(g)$OTU <- V(g)$name
+  }
+
+  if (is.null(V(g)$Genus)) {
+    V(g)$Genus <- "Unclassified"
+  }
+
+  if (is.null(V(g)$Phylum)) {
+    V(g)$Phylum <- "Unknown"
+  }
+
+  if (is.null(E(g)$sign)) {
+    E(g)$sign <- ifelse(E(g)$weight > 0, "positive", "negative")
+  }
+
+  g
+}
+
+# -----------------------------
+# 2. Plot one SPIEC-EASI network
+# -----------------------------
+plot_spiec_network <- function(g,
+                               group_name,
+                               top_hub_n = 10,
+                               output_file = NULL) {
+
+  g <- prepare_network_for_plot(g)
+
+  # hub taxa based on degree centrality
+  hub_nodes <- data.frame(
+    name = V(g)$name,
+    OTU = V(g)$OTU,
+    Genus = V(g)$Genus,
+    Degree = V(g)$Degree
+  ) %>%
+    arrange(desc(Degree)) %>%
+    slice_head(n = top_hub_n)
+
+  V(g)$HubLabel <- ifelse(
+    V(g)$name %in% hub_nodes$name,
+    paste(V(g)$OTU, V(g)$Genus, sep = "\n"),
+    NA
+  )
+
+  p <- ggraph(g, layout = "fr") +
+    geom_edge_link(
+      aes(color = sign),
+      alpha = 0.35,
+      linewidth = 0.35
+    ) +
+    geom_node_point(
+      aes(size = Degree, color = Phylum),
+      alpha = 0.90
+    ) +
+    geom_node_text(
+      aes(label = HubLabel),
+      size = 2.6,
+      repel = TRUE,
+      na.rm = TRUE
+    ) +
+    scale_edge_color_manual(
+      values = c(
+        "positive" = "orange",
+        "negative" = "blue"
+      )
+    ) +
+    scale_size_continuous(range = c(1.5, 7)) +
+    theme_void() +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(
+        hjust = 0.5,
+        face = "bold",
+        size = 14
+      )
+    ) +
+    labs(
+      title = paste0(group_name, " SPIEC-EASI subnetwork"),
+      edge_color = "Association",
+      color = "Phylum",
+      size = "Degree"
+    )
+
+  if (!is.null(output_file)) {
+    ggsave(
+      filename = output_file,
+      plot = p,
+      width = 10,
+      height = 8,
+      device = cairo_pdf
+    )
+  }
+
+  return(p)
+}
+
+# -----------------------------
+# 3. Plot all season × life type subnetworks
+# -----------------------------
+dir.create("SPIEC_EASI_network_plots", showWarnings = FALSE)
+
+for (nm in names(network_list)) {
+
+  g <- network_list[[nm]]
+
+  plot_spiec_network(
+    g = g,
+    group_name = nm,
+    top_hub_n = 10,
+    output_file = file.path(
+      "SPIEC_EASI_network_plots",
+      paste0("SPIEC_EASI_", nm, "_FR_layout.pdf")
+    )
+  )
+}
+
+# -----------------------------
+# 4. Optional: export hub taxa table
+# -----------------------------
+hub_table <- bind_rows(lapply(names(network_list), function(nm) {
+
+  g <- prepare_network_for_plot(network_list[[nm]])
+
+  data.frame(
+    Group = nm,
+    OTU = V(g)$OTU,
+    Genus = V(g)$Genus,
+    Phylum = V(g)$Phylum,
+    Degree = degree(g),
+    stringsAsFactors = FALSE
+  ) %>%
+    arrange(desc(Degree)) %>%
+    slice_head(n = 20)
+}))
+
+write.csv(
+  hub_table,
+  "SPIEC_EASI_hub_taxa_by_season_lifetype.csv",
+  row.names = FALSE
+)

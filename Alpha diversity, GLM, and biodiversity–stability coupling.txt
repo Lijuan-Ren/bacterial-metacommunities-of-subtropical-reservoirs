@@ -1,0 +1,347 @@
+# ============================================================
+# Alpha diversity, GLM, and biodiversity–stability coupling
+# ============================================================
+
+library(tidyverse)
+library(vegan)
+library(broom)
+library(ggplot2)
+library(openxlsx)
+
+# -----------------------------
+# 1. Load data
+# -----------------------------
+
+otu <- read.csv("Bacteria.otu.csv",
+                row.names = 1,
+                check.names = FALSE)
+
+meta <- read.csv("sample_metadata.csv",
+                 check.names = FALSE)
+
+network <- read.csv("SPIEC_EASI_site_network_metrics.csv",
+                    check.names = FALSE)
+
+# Required metadata columns:
+# SampleID, Season, LifeType, TSI, TrophicState
+
+# Required network columns:
+# SampleID, Network_stability, Robustness, Network_complexity
+# plus other network properties if needed
+
+# Remove taxonomy column if present
+if ("taxa" %in% colnames(otu)) {
+  otu_count <- otu[, colnames(otu) != "taxa"]
+} else {
+  otu_count <- otu
+}
+
+# Match samples
+shared_samples <- Reduce(
+  intersect,
+  list(colnames(otu_count), meta$SampleID, network$SampleID)
+)
+
+otu_count <- otu_count[, shared_samples]
+meta <- meta %>%
+  filter(SampleID %in% shared_samples) %>%
+  arrange(match(SampleID, shared_samples))
+
+network <- network %>%
+  filter(SampleID %in% shared_samples) %>%
+  arrange(match(SampleID, shared_samples))
+
+otu_count <- otu_count[, meta$SampleID]
+
+# -----------------------------
+# 2. Alpha diversity
+# -----------------------------
+
+# vegan requires samples as rows
+comm <- t(otu_count)
+
+alpha_df <- data.frame(
+  SampleID = rownames(comm),
+  Richness = specnumber(comm),
+  Shannon = diversity(comm, index = "shannon")
+)
+
+alpha_df <- alpha_df %>%
+  mutate(
+    Evenness = Shannon / log(Richness)
+  )
+
+alpha_df$Evenness[is.nan(alpha_df$Evenness)] <- NA
+
+# Merge alpha diversity, metadata, and network metrics
+dat <- meta %>%
+  left_join(alpha_df, by = "SampleID") %>%
+  left_join(network, by = "SampleID")
+
+# -----------------------------
+# 3. Define variables
+# -----------------------------
+
+biodiversity_vars <- c(
+  "Richness",
+  "Shannon",
+  "Evenness"
+)
+
+network_vars <- c(
+  "Nodes",
+  "Edges",
+  "Average_degree",
+  "Density",
+  "Clustering_coefficient",
+  "Degree_centralization",
+  "Average_path_length",
+  "Modularity"
+)
+
+stability_vars <- c(
+  "Network_stability",
+  "Robustness",
+  "Network_complexity"
+)
+
+network_vars <- intersect(network_vars, colnames(dat))
+stability_vars <- intersect(stability_vars, colnames(dat))
+
+# -----------------------------
+# 4. GLM function: response ~ TSI
+# -----------------------------
+
+run_glm_tsi <- function(data, response) {
+
+  df <- data %>%
+    select(TSI, all_of(response)) %>%
+    drop_na()
+
+  if (nrow(df) < 5) return(NULL)
+
+  fit <- glm(
+    as.formula(paste(response, "~ TSI")),
+    data = df,
+    family = gaussian()
+  )
+
+  model_sum <- summary(fit)
+
+  tibble(
+    Response = response,
+    N = nrow(df),
+    Intercept = coef(fit)[1],
+    Slope_TSI = coef(fit)[2],
+    SE = model_sum$coefficients[2, 2],
+    t_value = model_sum$coefficients[2, 3],
+    P_value = model_sum$coefficients[2, 4],
+    AIC = AIC(fit),
+    R2 = 1 - deviance(fit) / fit$null.deviance
+  )
+}
+
+# -----------------------------
+# 5. GLM: TSI vs biodiversity,
+#    network properties, and stability
+# -----------------------------
+
+response_vars <- c(
+  biodiversity_vars,
+  network_vars,
+  stability_vars
+)
+
+glm_tsi_results <- dat %>%
+  group_by(Season, LifeType, TrophicState) %>%
+  group_modify(~ {
+    bind_rows(
+      lapply(response_vars, function(v) {
+        run_glm_tsi(.x, v)
+      })
+    )
+  }) %>%
+  ungroup()
+
+write.csv(
+  glm_tsi_results,
+  "GLM_TSI_biodiversity_network_stability.csv",
+  row.names = FALSE
+)
+
+# -----------------------------
+# 6. Visualization:
+#    TSI vs biodiversity / network metrics
+# -----------------------------
+
+plot_tsi_data <- dat %>%
+  pivot_longer(
+    cols = all_of(response_vars),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+p_tsi <- ggplot(
+  plot_tsi_data,
+  aes(x = TSI, y = Value, color = TrophicState)
+) +
+  geom_point(size = 2.2, alpha = 0.75) +
+  geom_smooth(
+    method = "glm",
+    method.args = list(family = gaussian()),
+    se = TRUE,
+    linewidth = 0.9
+  ) +
+  facet_grid(Metric ~ Season + LifeType,
+             scales = "free_y") +
+  theme_bw() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    panel.grid = element_blank()
+  ) +
+  labs(
+    x = "Trophic state index (TSI)",
+    y = "Biodiversity / network metric",
+    color = "Trophic state"
+  )
+
+ggsave(
+  "GLM_TSI_biodiversity_network_stability.pdf",
+  p_tsi,
+  width = 14,
+  height = 18
+)
+
+# -----------------------------
+# 7. Biodiversity–stability coupling
+# -----------------------------
+
+run_coupling_glm <- function(data, response, predictor) {
+
+  df <- data %>%
+    select(all_of(c(response, predictor))) %>%
+    drop_na()
+
+  if (nrow(df) < 5) return(NULL)
+
+  fit <- glm(
+    as.formula(paste(response, "~", predictor)),
+    data = df,
+    family = gaussian()
+  )
+
+  model_sum <- summary(fit)
+
+  tibble(
+    Response = response,
+    Predictor = predictor,
+    N = nrow(df),
+    Intercept = coef(fit)[1],
+    Slope = coef(fit)[2],
+    SE = model_sum$coefficients[2, 2],
+    t_value = model_sum$coefficients[2, 3],
+    P_value = model_sum$coefficients[2, 4],
+    AIC = AIC(fit),
+    R2 = 1 - deviance(fit) / fit$null.deviance
+  )
+}
+
+coupling_results <- dat %>%
+  group_by(Season, LifeType, TrophicState) %>%
+  group_modify(~ {
+
+    out <- list()
+
+    for (resp in stability_vars) {
+      for (pred in c("Richness", "Shannon")) {
+
+        out[[paste(resp, pred, sep = "_")]] <-
+          run_coupling_glm(.x, resp, pred)
+      }
+    }
+
+    bind_rows(out)
+  }) %>%
+  ungroup()
+
+write.csv(
+  coupling_results,
+  "Biodiversity_stability_coupling_GLM.csv",
+  row.names = FALSE
+)
+
+# -----------------------------
+# 8. Visualization:
+#    biodiversity–stability coupling
+# -----------------------------
+
+plot_coupling_data <- dat %>%
+  pivot_longer(
+    cols = all_of(stability_vars),
+    names_to = "Stability_metric",
+    values_to = "Stability_value"
+  ) %>%
+  pivot_longer(
+    cols = c("Richness", "Shannon"),
+    names_to = "Biodiversity_metric",
+    values_to = "Biodiversity_value"
+  )
+
+p_coupling <- ggplot(
+  plot_coupling_data,
+  aes(x = Biodiversity_value,
+      y = Stability_value,
+      color = TrophicState)
+) +
+  geom_point(size = 2.2, alpha = 0.75) +
+  geom_smooth(
+    method = "glm",
+    method.args = list(family = gaussian()),
+    se = TRUE,
+    linewidth = 0.9
+  ) +
+  facet_grid(
+    Stability_metric ~ Biodiversity_metric + LifeType,
+    scales = "free"
+  ) +
+  theme_bw() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    panel.grid = element_blank()
+  ) +
+  labs(
+    x = "Bacterial biodiversity",
+    y = "Network stability / robustness / complexity",
+    color = "Trophic state"
+  )
+
+ggsave(
+  "Biodiversity_stability_coupling.pdf",
+  p_coupling,
+  width = 14,
+  height = 10
+)
+
+# -----------------------------
+# 9. Export all results to Excel
+# -----------------------------
+
+wb <- createWorkbook()
+
+addWorksheet(wb, "Merged_data")
+writeData(wb, "Merged_data", dat)
+
+addWorksheet(wb, "Alpha_diversity")
+writeData(wb, "Alpha_diversity", alpha_df)
+
+addWorksheet(wb, "GLM_TSI_results")
+writeData(wb, "GLM_TSI_results", glm_tsi_results)
+
+addWorksheet(wb, "Coupling_GLM_results")
+writeData(wb, "Coupling_GLM_results", coupling_results)
+
+saveWorkbook(
+  wb,
+  "Alpha_GLM_biodiversity_stability_results.xlsx",
+  overwrite = TRUE
+)
