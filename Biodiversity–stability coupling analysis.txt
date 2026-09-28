@@ -1,19 +1,16 @@
-# ============================================================
-# Biodiversity–stability coupling analysis
-# Regress network stability, robustness, and complexity
-# against OTU richness and Shannon diversity
-# within each trophic-state context
-# ============================================================
-
 library(tidyverse)
 library(broom)
+library(broom.mixed)
+library(lme4)
+library(lmerTest)
+library(emmeans)
 library(ggplot2)
 library(openxlsx)
 
 # ------------------------------------------------------------
 # Input data should contain at least:
-# SampleID, Season, LifeType, TrophicState,
-# Richness, Shannon,
+# SampleID, Reservoir, Season, LifeType, TrophicState,
+# Richness,
 # Network_stability, Robustness, Network_complexity
 # ------------------------------------------------------------
 
@@ -23,7 +20,16 @@ dat <- read.csv("SPIEC_EASI_site_network_metrics_alpha_diversity.csv",
 # optional: standardize names
 dat <- dat %>%
   rename(
-    TrophicState = Trophic state
+    TrophicState = `Trophic state`
+  )
+
+# Ensure factors are correctly specified
+dat <- dat %>%
+  mutate(
+    Reservoir    = factor(Reservoir),
+    Season       = factor(Season),
+    LifeType     = factor(LifeType),
+    TrophicState = factor(TrophicState)
   )
 
 # ------------------------------------------------------------
@@ -36,118 +42,143 @@ response_vars <- c(
   "Network_complexity"
 )
 
-diversity_vars <- c(
-  "Richness",
-  "Shannon"
-)
+# OTU richness is the sole biodiversity predictor
+predictor_var <- "Richness"
 
 # ------------------------------------------------------------
-# 2. GLM function
+# 2. Global LMM function:
+#    Network property ~ Richness * Season * LifeType *
+#                       TrophicState + (1 | Reservoir)
 # ------------------------------------------------------------
 
-run_biodiv_stability_glm <- function(data, response, predictor) {
+run_biodiv_stability_lmm <- function(data, response, predictor = "Richness") {
 
-  formula_i <- as.formula(
-    paste(response, "~", predictor)
+  df <- data %>%
+    select(
+      all_of(c(response, predictor)),
+      Season, LifeType, TrophicState, Reservoir
+    ) %>%
+    drop_na()
+
+  if (nrow(df) < 10 || nlevels(droplevels(df$Reservoir)) < 3) {
+    return(NULL)
+  }
+
+  fit <- lmerTest::lmer(
+    as.formula(paste(
+      response,
+      "~", predictor,
+      "* Season * LifeType * TrophicState + (1 | Reservoir)"
+    )),
+    data = df,
+    REML = TRUE
   )
 
-  fit <- glm(
-    formula_i,
-    data = data,
-    family = gaussian()
+  # ---- Global Type III tests for each fixed effect ----
+  anova_tab <- as.data.frame(anova(fit, type = 3))
+  anova_tab$Term <- rownames(anova_tab)
+  anova_tab$Response <- response
+  anova_tab$Predictor <- predictor
+  anova_tab$N <- nrow(df)
+
+  global_tab <- anova_tab %>%
+    select(Response, Predictor, Term, N,
+           `F value`, `Pr(>F)`, everything()) %>%
+    as_tibble()
+
+  # ---- Group-specific slopes from model contrasts ----
+  emm <- emmeans::emtrends(
+    fit,
+    ~ Season + LifeType + TrophicState,
+    var = predictor
   )
 
-  model_sum <- summary(fit)
+  slopes_tab <- as.data.frame(emm) %>%
+    as_tibble() %>%
+    rename(
+      Slope  = paste0(predictor, ".trend"),
+      SE     = SE,
+      df     = df,
+      t      = t.ratio,
+      P_raw  = p.value
+    ) %>%
+    mutate(
+      Response  = response,
+      Predictor = predictor,
+      # BH-adjust across all group-specific slopes for this model
+      P_adj = p.adjust(P_raw, method = "BH"),
+      # 95% CI
+      CI_low  = Slope - qt(0.975, df) * SE,
+      CI_high = Slope + qt(0.975, df) * SE
+    ) %>%
+    select(Response, Predictor, Season, LifeType, TrophicState,
+           Slope, SE, df, CI_low, CI_high, t, P_raw, P_adj)
 
-  tibble(
-    Response = response,
-    Predictor = predictor,
-    Intercept = coef(fit)[1],
-    Slope = coef(fit)[2],
-    SE = model_sum$coefficients[2, 2],
-    t_value = model_sum$coefficients[2, 3],
-    P_value = model_sum$coefficients[2, 4],
-    AIC = AIC(fit),
-    R2 = 1 - deviance(fit) / fit$null.deviance
-  )
+  list(global = global_tab, slopes = slopes_tab)
 }
 
 # ------------------------------------------------------------
-# 3. Run regressions separately for each trophic-state context
+# 3. Run global LMMs for each network property
 # ------------------------------------------------------------
 
-glm_results <- dat %>%
-  filter(
-    !is.na(TrophicState),
-    !is.na(Richness),
-    !is.na(Shannon)
-  ) %>%
-  group_by(Season, LifeType, TrophicState) %>%
-  group_modify(~ {
+lmm_out <- lapply(response_vars, function(resp) {
+  run_biodiv_stability_lmm(dat, resp, predictor = predictor_var)
+})
 
-    out <- list()
+lmm_global <- bind_rows(
+  lapply(lmm_out, function(x) if (is.null(x)) NULL else x$global)
+)
 
-    for (resp in response_vars) {
-      for (pred in diversity_vars) {
-
-        sub <- .x %>%
-          filter(
-            !is.na(.data[[resp]]),
-            !is.na(.data[[pred]])
-          )
-
-        if (nrow(sub) >= 5) {
-          out[[paste(resp, pred, sep = "_")]] <-
-            run_biodiv_stability_glm(sub, resp, pred)
-        }
-      }
-    }
-
-    bind_rows(out)
-  }) %>%
-  ungroup()
+lmm_slopes <- bind_rows(
+  lapply(lmm_out, function(x) if (is.null(x)) NULL else x$slopes)
+)
 
 # ------------------------------------------------------------
-# 4. Save GLM results
+# 4. Save LMM results
 # ------------------------------------------------------------
 
 write.csv(
-  glm_results,
-  "Biodiversity_stability_coupling_GLM_results.csv",
+  lmm_global,
+  "Biodiversity_stability_coupling_LMM_global.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  lmm_slopes,
+  "Biodiversity_stability_coupling_LMM_group_slopes.csv",
   row.names = FALSE
 )
 
 # ------------------------------------------------------------
-# 5. Plot biodiversity–stability relationships
+# 5. Plot biodiversity–network stability relationships
+#    OTU richness as the sole predictor
 # ------------------------------------------------------------
 
 plot_data <- dat %>%
+  select(
+    SampleID, Season, LifeType, TrophicState,
+    Richness, all_of(response_vars)
+  ) %>%
   pivot_longer(
     cols = all_of(response_vars),
     names_to = "Network_metric",
     values_to = "Network_value"
-  ) %>%
-  pivot_longer(
-    cols = all_of(diversity_vars),
-    names_to = "Diversity_metric",
-    values_to = "Diversity_value"
   )
 
 p <- ggplot(
   plot_data,
-  aes(x = Diversity_value,
+  aes(x = Richness,
       y = Network_value,
       color = TrophicState)
 ) +
   geom_point(size = 2.2, alpha = 0.75) +
   geom_smooth(
-    method = "glm",
-    method.args = list(family = gaussian()),
+    method = "lm",
     se = TRUE,
     linewidth = 0.9
   ) +
   facet_grid(
-    Network_metric ~ Diversity_metric,
+    Network_metric ~ Season + LifeType,
     scales = "free"
   ) +
   theme_bw() +
@@ -156,7 +187,7 @@ p <- ggplot(
     panel.grid = element_blank()
   ) +
   labs(
-    x = "Bacterial biodiversity",
+    x = "OTU richness",
     y = "Network stability / robustness / complexity",
     color = "Trophic state"
   )
@@ -164,8 +195,8 @@ p <- ggplot(
 ggsave(
   "Biodiversity_stability_coupling_all.pdf",
   p,
-  width = 10,
-  height = 8
+  width = 12,
+  height = 10
 )
 
 # ------------------------------------------------------------
@@ -186,19 +217,18 @@ for (ss in unique(dat$Season)) {
 
     p_i <- ggplot(
       sub_plot,
-      aes(x = Diversity_value,
+      aes(x = Richness,
           y = Network_value,
           color = TrophicState)
     ) +
       geom_point(size = 2.2, alpha = 0.75) +
       geom_smooth(
-        method = "glm",
-        method.args = list(family = gaussian()),
+        method = "lm",
         se = TRUE,
         linewidth = 0.9
       ) +
       facet_grid(
-        Network_metric ~ Diversity_metric,
+        Network_metric ~ .,
         scales = "free"
       ) +
       theme_bw() +
@@ -208,7 +238,7 @@ for (ss in unique(dat$Season)) {
       ) +
       labs(
         title = paste(ss, lt),
-        x = "Bacterial biodiversity",
+        x = "OTU richness",
         y = "Network stability / robustness / complexity",
         color = "Trophic state"
       )
