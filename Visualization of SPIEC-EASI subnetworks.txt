@@ -1,176 +1,136 @@
-# ============================================================
-# Visualization of SPIEC-EASI subnetworks
-# Fruchterman–Reingold layout with hub labels
-# ============================================================
+suppressPackageStartupMessages({
+  library(igraph)
+  library(ggraph)
+  library(ggplot2)
+  library(patchwork)
+})
 
-library(igraph)
-library(ggraph)
-library(tidyverse)
-library(ggrepel)
+input_file <- 'SPIEC_EASI_group_subnetworks.rds'
+if (!file.exists(input_file)) {
+  stop('Missing ', input_file,
+       '. Generate the eight trophic-state subnetworks before plotting.')
+}
+group_networks <- readRDS(input_file)
+expected <- c('Wet_FL_OMR', 'Wet_FL_ER',
+              'Wet_PA_OMR', 'Wet_PA_ER',
+              'Dry_FL_OMR', 'Dry_FL_ER',
+              'Dry_PA_OMR', 'Dry_PA_ER')
+if (!is.list(group_networks) || !all(expected %in% names(group_networks))) {
+  stop('The RDS must contain all eight Season_LifeType_TrophicState graphs.')
+}
+output_dir <- 'SPIEC_EASI_positive_network_plots'
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
 
-# ------------------------------------------------------------
-# Assume SPIEC-EASI networks have already been constructed
-# and stored as igraph objects:
-#
-# network_list <- list(
-#   Wet_FL = g_wet_fl,
-#   Wet_PA = g_wet_pa,
-#   Dry_FL = g_dry_fl,
-#   Dry_PA = g_dry_pa
-# )
-#
-# Each graph should contain:
-# V(g)$OTU
-# V(g)$Genus
-# V(g)$Phylum
-# E(g)$sign  # "positive" or "negative"
-# ------------------------------------------------------------
-
-# -----------------------------
-# 1. Prepare graph attributes
-# -----------------------------
-prepare_network_for_plot <- function(g) {
-
-  V(g)$Degree <- degree(g)
-
-  if (is.null(V(g)$OTU)) {
-    V(g)$OTU <- V(g)$name
-  }
-
-  if (is.null(V(g)$Genus)) {
-    V(g)$Genus <- "Unclassified"
-  }
-
-  if (is.null(V(g)$Phylum)) {
-    V(g)$Phylum <- "Unknown"
-  }
-
+positive_graph <- function(g) {
+  if (!inherits(g, 'igraph') || is_directed(g))
+    stop('Every input must be an undirected igraph object.')
+  if (is.null(V(g)$name) || anyDuplicated(V(g)$name))
+    stop('Unique OTU names are required as vertex names.')
+  if (!ecount(g)) return(g)
   if (is.null(E(g)$sign)) {
-    E(g)$sign <- ifelse(E(g)$weight > 0, "positive", "negative")
+    if (is.null(E(g)$weight) || anyNA(E(g)$weight) ||
+        any(E(g)$weight == 0))
+      stop('Edges require sign or nonzero signed weight attributes.')
+    E(g)$sign <- ifelse(E(g)$weight > 0, 'positive', 'negative')
   }
+  if (!all(E(g)$sign %in% c('positive', 'negative')))
+    stop('Edge signs must be positive or negative.')
+  if (!is.null(E(g)$weight) && ecount(g) &&
+      any((E(g)$weight > 0) != (E(g)$sign == 'positive')))
+    stop('Edge sign and coefficient weight disagree.')
 
-  g
+  # Preserve only positive inferred associations and remove isolates from
+  # this visualization. The original signed graphs remain unchanged.
+  gp <- subgraph.edges(g, E(g)[sign == 'positive'], delete.vertices = TRUE)
+  if (!is.null(E(gp)$weight) && ecount(gp) &&
+      any(!is.finite(E(gp)$weight)))
+    stop('Positive edges must have finite weights.')
+  gp
 }
 
-# -----------------------------
-# 2. Plot one SPIEC-EASI network
-# -----------------------------
-plot_spiec_network <- function(g,
-                               group_name,
-                               top_hub_n = 10,
-                               output_file = NULL) {
-
-  g <- prepare_network_for_plot(g)
-
-  # hub taxa based on degree centrality
-  hub_nodes <- data.frame(
-    name = V(g)$name,
-    OTU = V(g)$OTU,
-    Genus = V(g)$Genus,
-    Degree = V(g)$Degree
-  ) %>%
-    arrange(desc(Degree)) %>%
-    slice_head(n = top_hub_n)
-
-  V(g)$HubLabel <- ifelse(
-    V(g)$name %in% hub_nodes$name,
-    paste(V(g)$OTU, V(g)$Genus, sep = "\n"),
-    NA
-  )
-
-  p <- ggraph(g, layout = "fr") +
-    geom_edge_link(
-      aes(color = sign),
-      alpha = 0.35,
-      linewidth = 0.35
-    ) +
-    geom_node_point(
-      aes(size = Degree, color = Phylum),
-      alpha = 0.90
-    ) +
-    geom_node_text(
-      aes(label = HubLabel),
-      size = 2.6,
-      repel = TRUE,
-      na.rm = TRUE
-    ) +
-    scale_edge_color_manual(
-      values = c(
-        "positive" = "orange",
-        "negative" = "blue"
-      )
-    ) +
-    scale_size_continuous(range = c(1.5, 7)) +
-    theme_void() +
-    theme(
-      legend.position = "right",
-      plot.title = element_text(
-        hjust = 0.5,
-        face = "bold",
-        size = 14
-      )
-    ) +
-    labs(
-      title = paste0(group_name, " SPIEC-EASI subnetwork"),
-      edge_color = "Association",
-      color = "Phylum",
-      size = "Degree"
-    )
-
-  if (!is.null(output_file)) {
-    ggsave(
-      filename = output_file,
-      plot = p,
-      width = 10,
-      height = 8,
-      device = cairo_pdf
-    )
+plot_positive_network <- function(g, name, seed = 10010L) {
+  gp <- positive_graph(g)
+  if (vcount(gp) == 0 || ecount(gp) == 0) {
+    return(list(plot = ggplot() + theme_void() +
+                  labs(title = gsub('_', ' · ', name),
+                       subtitle = 'No positive associations'),
+                hubs = data.frame()))
   }
+  if (is.null(V(gp)$OTU)) V(gp)$OTU <- V(gp)$name
+  if (is.null(V(gp)$Genus)) V(gp)$Genus <- 'Unclassified'
+  genus <- as.character(V(gp)$Genus)
+  genus[is.na(genus) | !nzchar(genus)] <- 'Unclassified'
+  V(gp)$Genus <- genus
+  V(gp)$Degree <- degree(gp, mode = 'all')
 
-  return(p)
+  # Ties in degree are resolved by OTU identifier for repeatable labels.
+  hubs <- data.frame(OTU = V(gp)$OTU, Genus = V(gp)$Genus,
+                     Degree = V(gp)$Degree, stringsAsFactors = FALSE)
+  hubs <- hubs[order(-hubs$Degree, hubs$OTU), , drop = FALSE]
+  hubs <- head(hubs, 5L)
+  hubs$Group <- name
+  hub_label <- paste0(hubs$OTU, ' (', hubs$Genus, ')')
+  V(gp)$HubLabel <- rep(NA_character_, vcount(gp))
+  V(gp)$HubLabel[match(hubs$OTU, V(gp)$OTU)] <- hub_label
+
+  # One seeded Fruchterman-Reingold layout per positive graph. Use absolute
+  # coefficients as nonnegative layout weights, if present. Edge widths are
+  # fixed to emphasize structure and legibility rather than effect magnitude.
+  set.seed(seed)
+  layout_weights <- if (is.null(E(gp)$weight)) NA else abs(E(gp)$weight)
+  xy <- layout_with_fr(gp, weights = layout_weights)
+  xy <- as.matrix(xy)
+  p <- ggraph(gp, layout = 'manual', x = xy[, 1], y = xy[, 2]) +
+    geom_edge_link(colour = '#9BAAB0', alpha = 0.24, linewidth = 0.25,
+                   show.legend = FALSE) +
+    geom_node_point(aes(size = Degree), colour = '#317D9F', alpha = 0.85,
+                    show.legend = FALSE) +
+    geom_node_text(aes(label = HubLabel), repel = TRUE, na.rm = TRUE,
+                   size = 2.5, colour = '#183C50', fontface = 'bold',
+                   max.overlaps = Inf, box.padding = 0.3,
+                   point.padding = 0.15, show.legend = FALSE) +
+    scale_size_continuous(range = c(1, 4.5)) +
+    coord_equal(clip = 'off') +
+    theme_void(base_size = 10) +
+    theme(plot.title = element_text(hjust = 0.5, face = 'bold', size = 11),
+          plot.subtitle = element_text(hjust = 0.5, size = 8),
+          plot.margin = margin(8, 14, 8, 14)) +
+    labs(title = gsub('_', ' · ', name),
+         subtitle = sprintf('%d OTUs · %d positive associations',
+                            vcount(gp), ecount(gp)))
+  list(plot = p, hubs = hubs)
 }
 
-# -----------------------------
-# 3. Plot all season × life type subnetworks
-# -----------------------------
-dir.create("SPIEC_EASI_network_plots", showWarnings = FALSE)
-
-for (nm in names(network_list)) {
-
-  g <- network_list[[nm]]
-
-  plot_spiec_network(
-    g = g,
-    group_name = nm,
-    top_hub_n = 10,
-    output_file = file.path(
-      "SPIEC_EASI_network_plots",
-      paste0("SPIEC_EASI_", nm, "_FR_layout.pdf")
-    )
-  )
+plots <- vector('list', length(expected)); names(plots) <- expected
+hub_rows <- vector('list', length(expected)); names(hub_rows) <- expected
+for (name in expected) {
+  result <- plot_positive_network(group_networks[[name]], name)
+  plots[[name]] <- result$plot
+  hub_rows[[name]] <- result$hubs
+  ggsave(file.path(output_dir, paste0('Figure4_', name, '_positive.pdf')),
+         result$plot, width = 7.5, height = 6.2, device = cairo_pdf)
 }
 
-# -----------------------------
-# 4. Optional: export hub taxa table
-# -----------------------------
-hub_table <- bind_rows(lapply(names(network_list), function(nm) {
+# Arrange wet and dry seasons by rows, with FL/PA x OMR/ER across columns.
+figure4 <- wrap_plots(plots, ncol = 4, byrow = TRUE) +
+  plot_annotation(
+    title = 'Positive bacterial associations across trophic states',
+    subtitle = paste('SPIEC-EASI subnetworks induced from four regional',
+                     'season-by-lifestyle networks'),
+    caption = paste('Only positive associations are shown;',
+                    'five highest-degree OTUs are labelled per network.'),
+    theme = theme(plot.title = element_text(hjust = 0.5, face = 'bold'),
+                  plot.subtitle = element_text(hjust = 0.5),
+                  plot.caption = element_text(hjust = 0.5)))
+ggsave(file.path(output_dir, 'Figure4_eight_positive_networks.pdf'),
+       figure4, width = 20, height = 9, device = cairo_pdf, limitsize = FALSE)
 
-  g <- prepare_network_for_plot(network_list[[nm]])
-
-  data.frame(
-    Group = nm,
-    OTU = V(g)$OTU,
-    Genus = V(g)$Genus,
-    Phylum = V(g)$Phylum,
-    Degree = degree(g),
-    stringsAsFactors = FALSE
-  ) %>%
-    arrange(desc(Degree)) %>%
-    slice_head(n = 20)
-}))
-
-write.csv(
-  hub_table,
-  "SPIEC_EASI_hub_taxa_by_season_lifetype.csv",
-  row.names = FALSE
-)
+nonempty_hubs <- Filter(function(x) nrow(x) > 0, hub_rows)
+if (length(nonempty_hubs)) {
+  hub_table <- do.call(rbind, nonempty_hubs)
+  rownames(hub_table) <- NULL
+  hub_table <- hub_table[, c('Group', 'OTU', 'Genus', 'Degree')]
+  write.csv(hub_table,
+            file.path(output_dir, 'Figure4_top5_positive_hubs.csv'),
+            row.names = FALSE)
+}
