@@ -1,10 +1,10 @@
-# ============================================================
-# Alpha diversity, GLM, and biodiversity–stability coupling
-# ============================================================
-
 library(tidyverse)
 library(vegan)
 library(broom)
+library(broom.mixed)
+library(lme4)
+library(lmerTest)
+library(emmeans)
 library(ggplot2)
 library(openxlsx)
 
@@ -23,7 +23,7 @@ network <- read.csv("SPIEC_EASI_site_network_metrics.csv",
                     check.names = FALSE)
 
 # Required metadata columns:
-# SampleID, Season, LifeType, TSI, TrophicState
+# SampleID, Reservoir, Season, LifeType, TSI, TrophicState
 
 # Required network columns:
 # SampleID, Network_stability, Robustness, Network_complexity
@@ -43,6 +43,7 @@ shared_samples <- Reduce(
 )
 
 otu_count <- otu_count[, shared_samples]
+
 meta <- meta %>%
   filter(SampleID %in% shared_samples) %>%
   arrange(match(SampleID, shared_samples))
@@ -54,7 +55,7 @@ network <- network %>%
 otu_count <- otu_count[, meta$SampleID]
 
 # -----------------------------
-# 2. Alpha diversity
+# 2. Alpha diversity (richness only)
 # -----------------------------
 
 # vegan requires samples as rows
@@ -62,18 +63,10 @@ comm <- t(otu_count)
 
 alpha_df <- data.frame(
   SampleID = rownames(comm),
-  Richness = specnumber(comm),
-  Shannon = diversity(comm, index = "shannon")
+  Richness = specnumber(comm)
 )
 
-alpha_df <- alpha_df %>%
-  mutate(
-    Evenness = Shannon / log(Richness)
-  )
-
-alpha_df$Evenness[is.nan(alpha_df$Evenness)] <- NA
-
-# Merge alpha diversity, metadata, and network metrics
+# Merge richness, metadata, and network metrics
 dat <- meta %>%
   left_join(alpha_df, by = "SampleID") %>%
   left_join(network, by = "SampleID")
@@ -82,11 +75,8 @@ dat <- meta %>%
 # 3. Define variables
 # -----------------------------
 
-biodiversity_vars <- c(
-  "Richness",
-  "Shannon",
-  "Evenness"
-)
+# OTU richness is the sole biodiversity predictor
+biodiversity_vars <- c("Richness")
 
 network_vars <- c(
   "Nodes",
@@ -108,43 +98,51 @@ stability_vars <- c(
 network_vars <- intersect(network_vars, colnames(dat))
 stability_vars <- intersect(stability_vars, colnames(dat))
 
+# Ensure factors are correctly specified
+dat <- dat %>%
+  mutate(
+    Reservoir    = factor(Reservoir),
+    Season       = factor(Season),
+    LifeType     = factor(LifeType),
+    TrophicState = factor(TrophicState)
+  )
+
 # -----------------------------
-# 4. GLM function: response ~ TSI
+# 4. Global LMM: response ~ TSI
+#    (accounts for within-reservoir dependence)
 # -----------------------------
 
-run_glm_tsi <- function(data, response) {
+run_lmm_tsi <- function(data, response) {
 
   df <- data %>%
-    select(TSI, all_of(response)) %>%
+    select(TSI, Season, LifeType, TrophicState,
+           Reservoir, all_of(response)) %>%
     drop_na()
 
-  if (nrow(df) < 5) return(NULL)
+  if (nrow(df) < 10 || nlevels(droplevels(df$Reservoir)) < 3) {
+    return(NULL)
+  }
 
-  fit <- glm(
-    as.formula(paste(response, "~ TSI")),
+  fit <- lmerTest::lmer(
+    as.formula(paste(
+      response,
+      "~ TSI * Season * LifeType * TrophicState + (1 | Reservoir)"
+    )),
     data = df,
-    family = gaussian()
+    REML = TRUE
   )
 
-  model_sum <- summary(fit)
+  # Type III Wald F tests with Satterthwaite df
+  anova_tab <- as.data.frame(anova(fit, type = 3))
+  anova_tab$Term <- rownames(anova_tab)
+  anova_tab$Response <- response
+  anova_tab$N <- nrow(df)
 
-  tibble(
-    Response = response,
-    N = nrow(df),
-    Intercept = coef(fit)[1],
-    Slope_TSI = coef(fit)[2],
-    SE = model_sum$coefficients[2, 2],
-    t_value = model_sum$coefficients[2, 3],
-    P_value = model_sum$coefficients[2, 4],
-    AIC = AIC(fit),
-    R2 = 1 - deviance(fit) / fit$null.deviance
-  )
+  anova_tab %>%
+    select(Response, Term, N,
+           `F value`, `Pr(>F)`, everything()) %>%
+    as_tibble()
 }
-
-# -----------------------------
-# 5. GLM: TSI vs biodiversity,
-#    network properties, and stability
-# -----------------------------
 
 response_vars <- c(
   biodiversity_vars,
@@ -152,25 +150,20 @@ response_vars <- c(
   stability_vars
 )
 
-glm_tsi_results <- dat %>%
-  group_by(Season, LifeType, TrophicState) %>%
-  group_modify(~ {
-    bind_rows(
-      lapply(response_vars, function(v) {
-        run_glm_tsi(.x, v)
-      })
-    )
-  }) %>%
-  ungroup()
+lmm_tsi_results <- bind_rows(
+  lapply(response_vars, function(v) {
+    run_lmm_tsi(dat, v)
+  })
+)
 
 write.csv(
-  glm_tsi_results,
-  "GLM_TSI_biodiversity_network_stability.csv",
+  lmm_tsi_results,
+  "LMM_TSI_biodiversity_network_stability.csv",
   row.names = FALSE
 )
 
 # -----------------------------
-# 6. Visualization:
+# 5. Visualization:
 #    TSI vs biodiversity / network metrics
 # -----------------------------
 
@@ -187,8 +180,7 @@ p_tsi <- ggplot(
 ) +
   geom_point(size = 2.2, alpha = 0.75) +
   geom_smooth(
-    method = "glm",
-    method.args = list(family = gaussian()),
+    method = "lm",
     se = TRUE,
     linewidth = 0.9
   ) +
@@ -206,102 +198,134 @@ p_tsi <- ggplot(
   )
 
 ggsave(
-  "GLM_TSI_biodiversity_network_stability.pdf",
+  "LMM_TSI_biodiversity_network_stability.pdf",
   p_tsi,
   width = 14,
   height = 18
 )
 
 # -----------------------------
-# 7. Biodiversity–stability coupling
+# 6. Global LMM: biodiversity-network stability coupling
+#    Network property ~ Richness * Season * LifeType *
+#                       TrophicState + (1 | Reservoir)
 # -----------------------------
 
-run_coupling_glm <- function(data, response, predictor) {
+run_coupling_lmm <- function(data, response, predictor = "Richness") {
 
   df <- data %>%
-    select(all_of(c(response, predictor))) %>%
+    select(all_of(c(response, predictor)),
+           Season, LifeType, TrophicState, Reservoir) %>%
     drop_na()
 
-  if (nrow(df) < 5) return(NULL)
+  if (nrow(df) < 10 || nlevels(droplevels(df$Reservoir)) < 3) {
+    return(NULL)
+  }
 
-  fit <- glm(
-    as.formula(paste(response, "~", predictor)),
+  fit <- lmerTest::lmer(
+    as.formula(paste(
+      response,
+      "~", predictor,
+      "* Season * LifeType * TrophicState + (1 | Reservoir)"
+    )),
     data = df,
-    family = gaussian()
+    REML = TRUE
   )
 
-  model_sum <- summary(fit)
+  # Global Type III tests for each fixed effect
+  anova_tab <- as.data.frame(anova(fit, type = 3))
+  anova_tab$Term <- rownames(anova_tab)
+  anova_tab$Response <- response
+  anova_tab$Predictor <- predictor
+  anova_tab$N <- nrow(df)
 
-  tibble(
-    Response = response,
-    Predictor = predictor,
-    N = nrow(df),
-    Intercept = coef(fit)[1],
-    Slope = coef(fit)[2],
-    SE = model_sum$coefficients[2, 2],
-    t_value = model_sum$coefficients[2, 3],
-    P_value = model_sum$coefficients[2, 4],
-    AIC = AIC(fit),
-    R2 = 1 - deviance(fit) / fit$null.deviance
+  global_tab <- anova_tab %>%
+    select(Response, Predictor, Term, N,
+           `F value`, `Pr(>F)`, everything()) %>%
+    as_tibble()
+
+  # Group-specific slopes from model contrasts (emtrends)
+  emm <- emmeans::emtrends(
+    fit,
+    ~ Season + LifeType + TrophicState,
+    var = predictor
   )
+
+  slopes_tab <- as.data.frame(emm) %>%
+    as_tibble() %>%
+    rename(
+      Slope = paste0(predictor, ".trend"),
+      SE    = SE,
+      df    = df,
+      t     = t.ratio,
+      P_raw = p.value
+    ) %>%
+    mutate(
+      Response  = response,
+      Predictor = predictor,
+      # BH-adjust across all group-specific slopes for this model
+      P_adj = p.adjust(P_raw, method = "BH"),
+      # 95% CI
+      CI_low  = Slope - qt(0.975, df) * SE,
+      CI_high = Slope + qt(0.975, df) * SE
+    ) %>%
+    select(Response, Predictor, Season, LifeType, TrophicState,
+           Slope, SE, df, CI_low, CI_high, t, P_raw, P_adj)
+
+  list(global = global_tab, slopes = slopes_tab)
 }
 
-coupling_results <- dat %>%
-  group_by(Season, LifeType, TrophicState) %>%
-  group_modify(~ {
+coupling_out <- lapply(stability_vars, function(resp) {
+  run_coupling_lmm(dat, resp, predictor = "Richness")
+})
 
-    out <- list()
+coupling_global <- bind_rows(
+  lapply(coupling_out, function(x) if (is.null(x)) NULL else x$global)
+)
 
-    for (resp in stability_vars) {
-      for (pred in c("Richness", "Shannon")) {
-
-        out[[paste(resp, pred, sep = "_")]] <-
-          run_coupling_glm(.x, resp, pred)
-      }
-    }
-
-    bind_rows(out)
-  }) %>%
-  ungroup()
+coupling_slopes <- bind_rows(
+  lapply(coupling_out, function(x) if (is.null(x)) NULL else x$slopes)
+)
 
 write.csv(
-  coupling_results,
-  "Biodiversity_stability_coupling_GLM.csv",
+  coupling_global,
+  "Biodiversity_stability_coupling_LMM_global.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  coupling_slopes,
+  "Biodiversity_stability_coupling_LMM_group_slopes.csv",
   row.names = FALSE
 )
 
 # -----------------------------
-# 8. Visualization:
-#    biodiversity–stability coupling
+# 7. Visualization:
+#    biodiversity-network stability coupling
 # -----------------------------
 
 plot_coupling_data <- dat %>%
+  select(SampleID, Season, LifeType, TrophicState,
+         Richness, all_of(stability_vars)) %>%
   pivot_longer(
     cols = all_of(stability_vars),
     names_to = "Stability_metric",
     values_to = "Stability_value"
-  ) %>%
-  pivot_longer(
-    cols = c("Richness", "Shannon"),
-    names_to = "Biodiversity_metric",
-    values_to = "Biodiversity_value"
   )
 
 p_coupling <- ggplot(
   plot_coupling_data,
-  aes(x = Biodiversity_value,
+  aes(x = Richness,
       y = Stability_value,
       color = TrophicState)
 ) +
   geom_point(size = 2.2, alpha = 0.75) +
   geom_smooth(
-    method = "glm",
-    method.args = list(family = gaussian()),
+    method = "lm",
     se = TRUE,
     linewidth = 0.9
   ) +
   facet_grid(
-    Stability_metric ~ Biodiversity_metric + LifeType,
+    Stability_metric ~ Season + LifeType,
     scales = "free"
   ) +
   theme_bw() +
@@ -310,7 +334,7 @@ p_coupling <- ggplot(
     panel.grid = element_blank()
   ) +
   labs(
-    x = "Bacterial biodiversity",
+    x = "OTU richness",
     y = "Network stability / robustness / complexity",
     color = "Trophic state"
   )
@@ -318,12 +342,12 @@ p_coupling <- ggplot(
 ggsave(
   "Biodiversity_stability_coupling.pdf",
   p_coupling,
-  width = 14,
+  width = 12,
   height = 10
 )
 
 # -----------------------------
-# 9. Export all results to Excel
+# 8. Export all results to Excel
 # -----------------------------
 
 wb <- createWorkbook()
@@ -334,14 +358,17 @@ writeData(wb, "Merged_data", dat)
 addWorksheet(wb, "Alpha_diversity")
 writeData(wb, "Alpha_diversity", alpha_df)
 
-addWorksheet(wb, "GLM_TSI_results")
-writeData(wb, "GLM_TSI_results", glm_tsi_results)
+addWorksheet(wb, "LMM_TSI_results")
+writeData(wb, "LMM_TSI_results", lmm_tsi_results)
 
-addWorksheet(wb, "Coupling_GLM_results")
-writeData(wb, "Coupling_GLM_results", coupling_results)
+addWorksheet(wb, "Coupling_LMM_global")
+writeData(wb, "Coupling_LMM_global", coupling_global)
+
+addWorksheet(wb, "Coupling_LMM_slopes")
+writeData(wb, "Coupling_LMM_slopes", coupling_slopes)
 
 saveWorkbook(
   wb,
-  "Alpha_GLM_biodiversity_stability_results.xlsx",
+  "Alpha_LMM_biodiversity_stability_results.xlsx",
   overwrite = TRUE
 )
