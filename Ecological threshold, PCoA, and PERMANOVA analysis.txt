@@ -1,13 +1,9 @@
-# ============================================================
-# Ecological threshold, PCoA, and PERMANOVA analysis
-# Bacterial community composition along TSI gradient
-# ============================================================
-
 library(tidyverse)
 library(vegan)
 library(segmented)
 library(pairwiseAdonis)
 library(openxlsx)
+library(pheatmap)
 
 # ------------------------------------------------------------
 # 1. Load data
@@ -21,7 +17,8 @@ meta <- read.csv("sample_metadata.csv",
                  check.names = FALSE)
 
 # Required metadata columns:
-# SampleID, Season, LifeType, TSI
+# SampleID, Reservoir, Season, LifeType, TSI, TrophicState
+# plus environmental variables for envfit
 
 # Remove taxonomy column if present
 if ("taxa" %in% colnames(otu)) {
@@ -38,6 +35,15 @@ meta <- meta %>%
 
 otu <- otu[, meta$SampleID]
 
+# Ensure factors are correctly specified
+meta <- meta %>%
+  mutate(
+    Reservoir    = factor(Reservoir),
+    Season       = factor(Season),
+    LifeType     = factor(LifeType),
+    TrophicState = factor(TrophicState)
+  )
+
 # ------------------------------------------------------------
 # 2. Relative abundance transformation
 # ------------------------------------------------------------
@@ -49,7 +55,7 @@ otu_rel[is.na(otu_rel)] <- 0
 comm <- t(otu_rel)
 
 # ------------------------------------------------------------
-# 3. Bray–Curtis distance and PCoA
+# 3. Bray-Curtis distance and PCoA
 # ------------------------------------------------------------
 
 bray_dist <- vegdist(comm, method = "bray")
@@ -68,24 +74,49 @@ pcoa_scores <- left_join(pcoa_scores, meta, by = "SampleID")
 
 # ------------------------------------------------------------
 # 4. Segmented regression: PCoA1 ~ TSI
+#    Aggregated at reservoir x season x lifestyle level
+#    to reduce pseudoreplication
 # ------------------------------------------------------------
 
-lm_fit <- lm(PCoA1 ~ TSI, data = pcoa_scores)
+agg_dat <- pcoa_scores %>%
+  group_by(Reservoir, Season, LifeType) %>%
+  summarise(
+    TSI    = mean(TSI, na.rm = TRUE),
+    PCoA1  = mean(PCoA1, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+lm_fit <- lm(PCoA1 ~ TSI, data = agg_dat)
 
 seg_fit <- segmented(
   lm_fit,
-  seg.Z = ~ TSI,
-  )
+  seg.Z = ~ TSI
+)
 
 summary(seg_fit)
 
-breakpoint <- as.data.frame(summary(seg_fit)$psi)
-breakpoint_TSI <- breakpoint$Est.[1]
+# Breakpoint and profile-likelihood 95% CI
+breakpoint_TSI <- seg_fit$psi[1, "Est."]
+bp_ci <- confint(seg_fit)   # profile-likelihood CI for breakpoint
 
 cat("Estimated breakpoint TSI =", breakpoint_TSI, "\n")
+print(bp_ci)
+
+breakpoint_df <- data.frame(
+  Breakpoint = breakpoint_TSI,
+  CI_low     = bp_ci["psi1.TSI", 1],
+  CI_high    = bp_ci["psi1.TSI", 2]
+)
+
+# Compare segmented vs non-segmented model (Delta AIC)
+aic_lm  <- AIC(lm_fit)
+aic_seg <- AIC(seg_fit)
+delta_aic <- aic_lm - aic_seg
+
+cat("Delta AIC (non-segmented - segmented) =", delta_aic, "\n")
 
 # Save fitted values
-pcoa_scores$Segmented_fit <- fitted(seg_fit)
+agg_dat$Segmented_fit <- fitted(seg_fit)
 
 # ------------------------------------------------------------
 # 5. Classify trophic-state groups
@@ -94,7 +125,7 @@ pcoa_scores$Segmented_fit <- fitted(seg_fit)
 pcoa_scores <- pcoa_scores %>%
   mutate(
     TrophicGroup = case_when(
-      TSI >= 30 & TSI < 50 ~ "OMR",
+      TSI >= 32 & TSI < 50 ~ "OMR",
       TSI >= 50 & TSI <= 63 ~ "ER",
       TRUE ~ NA_character_
     )
@@ -109,10 +140,9 @@ pcoa_scores$TrophicGroup <- factor(
 # 6. Plot segmented regression
 # ------------------------------------------------------------
 
-p1 <- ggplot(pcoa_scores,
-             aes(x = TSI, y = PCoA1,
-                 color = TrophicGroup)) +
-  geom_point(size = 2.5, alpha = 0.8) +
+p1 <- ggplot(agg_dat,
+             aes(x = TSI, y = PCoA1)) +
+  geom_point(size = 2.5, alpha = 0.8, color = "grey30") +
   geom_line(aes(y = Segmented_fit),
             color = "black",
             linewidth = 1) +
@@ -124,9 +154,11 @@ p1 <- ggplot(pcoa_scores,
   labs(
     x = "Trophic state index (TSI)",
     y = "PCoA1",
-    color = "Trophic group",
     title = paste0("Segmented regression breakpoint: TSI = ",
-                   round(breakpoint_TSI, 2))
+                   round(breakpoint_TSI, 2),
+                   " (95% CI: ",
+                   round(bp_ci["psi1.TSI", 1], 2), "-",
+                   round(bp_ci["psi1.TSI", 2], 2), ")")
   )
 
 ggsave("Segmented_regression_PCoA1_TSI.pdf",
@@ -135,57 +167,58 @@ ggsave("Segmented_regression_PCoA1_TSI.pdf",
        height = 5)
 
 # ------------------------------------------------------------
-# 7. PERMANOVA: season, lifestyle, trophic group
+# 7. PERMANOVA: continuous and categorical models
+#    Permutations constrained within reservoirs
 # ------------------------------------------------------------
 
-# Make sure metadata order matches community matrix
 meta_perm <- pcoa_scores %>%
   filter(!is.na(TrophicGroup)) %>%
   arrange(match(SampleID, rownames(comm)))
 
 comm_perm <- comm[meta_perm$SampleID, ]
-
 bray_perm <- vegdist(comm_perm, method = "bray")
 
-permanova_main <- adonis2(
-  bray_perm ~ Season + LifeType + TrophicGroup,
+# Continuous model: Season * LifeType * TSI
+permanova_continuous <- adonis2(
+  bray_perm ~ Season * LifeType * TSI,
   data = meta_perm,
   permutations = 999,
+  strata = meta_perm$Reservoir,
   by = "margin"
 )
 
-print(permanova_main)
+print(permanova_continuous)
 
-# Full interaction model if needed
-permanova_interaction <- adonis2(
-  bray_perm ~ Season * LifeType * TrophicGroup,
-  data = meta_perm,
-  permutations = 999
-)
-
-print(permanova_interaction)
-
-# ------------------------------------------------------------
-# 8. Pairwise PERMANOVA among season × lifetype groups
-# ------------------------------------------------------------
-
-meta_perm <- meta_perm %>%
-  mutate(
-    Season_LifeType = paste(Season, LifeType, sep = "_")
-  )
-
-pairwise_perm <- pairwise.adonis2(
-  bray_perm ~ Season_LifeType,
+# Categorical model: Season * LifeType * TrophicState
+permanova_categorical <- adonis2(
+  bray_perm ~ Season * LifeType * TrophicState,
   data = meta_perm,
   permutations = 999,
-  p.adjust.m = "BH"
+  strata = meta_perm$Reservoir,
+  by = "margin"
 )
 
-print(pairwise_perm)
+print(permanova_categorical)
 
 # ------------------------------------------------------------
-# 9. Optional pairwise PERMANOVA among all
-#    season × lifetype × trophic groups
+# 8. PERMDISP: homogeneity of multivariate dispersion
+# ------------------------------------------------------------
+
+disp_season <- betadisper(bray_perm, meta_perm$Season)
+disp_life   <- betadisper(bray_perm, meta_perm$LifeType)
+disp_troph  <- betadisper(bray_perm, meta_perm$TrophicState)
+
+permdisp_season <- permutest(disp_season, permutations = 999)
+permdisp_life   <- permutest(disp_life,   permutations = 999)
+permdisp_troph  <- permutest(disp_troph,  permutations = 999)
+
+print(permdisp_season)
+print(permdisp_life)
+print(permdisp_troph)
+
+# ------------------------------------------------------------
+# 9. Pairwise PERMANOVA among season x lifestyle x trophic groups
+#    BH-adjusted
 # ------------------------------------------------------------
 
 meta_perm <- meta_perm %>%
@@ -203,7 +236,76 @@ pairwise_perm_all <- pairwise.adonis2(
 print(pairwise_perm_all)
 
 # ------------------------------------------------------------
-# 10. Export results
+# 10. envfit: environmental correlates of community composition
+#     BH correction across environmental variables
+# ------------------------------------------------------------
+
+env_vars <- c("TSI", "TN", "TP", "Chla", "SD", "Conductivity", "Salinity")
+env_vars <- intersect(env_vars, colnames(meta_perm))
+
+env_matrix <- meta_perm %>%
+  select(all_of(env_vars)) %>%
+  drop_na()
+
+# Align community matrix with complete env records
+comm_env <- comm_perm[meta_perm$SampleID %in% meta_perm$SampleID, ]
+comm_env <- comm_env[rownames(env_matrix), ]
+
+set.seed(10010)
+env_fit <- envfit(
+  comm_env ~ .,
+  data = env_matrix,
+  permutations = 999
+)
+
+env_scores <- as.data.frame(scores(env_fit, display = "vectors"))
+env_scores$Variable <- rownames(env_scores)
+env_scores$P_raw    <- env_fit$vectors$pvals
+env_scores$R2       <- env_fit$vectors$r
+env_scores$P_adj    <- p.adjust(env_scores$P_raw, method = "BH")
+
+print(env_scores)
+
+# ------------------------------------------------------------
+# 11. Heatmap of the 40 most abundant genera
+#     log-transform -> taxon-wise Z-score -> Bray-Curtis clustering
+# ------------------------------------------------------------
+
+# Requires a genus-level abundance table with taxonomy
+# (rows = genera, columns = SampleID)
+genus_abund <- read.csv("Genus_abundance.csv",
+                        row.names = 1,
+                        check.names = FALSE)
+
+# Keep the 40 most abundant genera
+top40 <- genus_abund[order(rowMeans(genus_abund), decreasing = TRUE)[1:40], ]
+
+# Log-transform relative abundances
+top40_log <- log10(top40 + 1e-6)
+
+# Taxon-wise Z-score standardization (rows = genera)
+top40_z <- t(scale(t(top40_log)))
+
+# Hierarchical clustering based on Bray-Curtis dissimilarities
+bray_genera <- vegdist(t(top40_z), method = "bray")
+row_hclust  <- hclust(vegdist(top40_z, method = "bray"), method = "average")
+col_hclust  <- hclust(bray_genera, method = "average")
+
+pheatmap(
+  top40_z,
+  cluster_rows = row_hclust,
+  cluster_cols = col_hclust,
+  color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+  show_rownames = TRUE,
+  show_colnames = FALSE,
+  fontsize_row = 8,
+  filename = "Heatmap_top40_genera.pdf",
+  width = 10,
+  height = 10
+)
+
+# ------------------------------------------------------------
+# 12. Export results
 # ------------------------------------------------------------
 
 wb <- createWorkbook()
@@ -211,34 +313,49 @@ wb <- createWorkbook()
 addWorksheet(wb, "PCoA_scores")
 writeData(wb, "PCoA_scores", pcoa_scores)
 
+addWorksheet(wb, "Aggregated_segmented")
+writeData(wb, "Aggregated_segmented", agg_dat)
+
 addWorksheet(wb, "Breakpoint")
-writeData(wb, "Breakpoint", breakpoint)
+writeData(wb, "Breakpoint", breakpoint_df)
 
-addWorksheet(wb, "PERMANOVA_main")
-writeData(wb, "PERMANOVA_main",
-          as.data.frame(permanova_main))
+addWorksheet(wb, "PERMANOVA_continuous")
+writeData(wb, "PERMANOVA_continuous",
+          as.data.frame(permanova_continuous))
 
-addWorksheet(wb, "PERMANOVA_interaction")
-writeData(wb, "PERMANOVA_interaction",
-          as.data.frame(permanova_interaction))
+addWorksheet(wb, "PERMANOVA_categorical")
+writeData(wb, "PERMANOVA_categorical",
+          as.data.frame(permanova_categorical))
 
-addWorksheet(wb, "Pairwise_season_lifetype")
-writeData(wb, "Pairwise_season_lifetype",
-          as.data.frame(pairwise_perm))
+addWorksheet(wb, "PERMDISP")
+writeData(wb, "PERMDISP",
+          data.frame(
+            Factor = c("Season", "LifeType", "TrophicState"),
+            F      = c(permdisp_season$tab$F[1],
+                       permdisp_life$tab$F[1],
+                       permdisp_troph$tab$F[1]),
+            P      = c(permdisp_season$tab$`Pr(>F)`[1],
+                       permdisp_life$tab$`Pr(>F)`[1],
+                       permdisp_troph$tab$`Pr(>F)`[1])
+          ))
 
 addWorksheet(wb, "Pairwise_all_groups")
 writeData(wb, "Pairwise_all_groups",
           as.data.frame(pairwise_perm_all))
 
+addWorksheet(wb, "envfit")
+writeData(wb, "envfit", env_scores)
+
 saveWorkbook(
   wb,
-  "PCoA_segmented_PERMANOVA_results.xlsx",
+  "PCoA_segmented_PERMANOVA_PERMDISP_envfit_results.xlsx",
   overwrite = TRUE
 )
 
 # ------------------------------------------------------------
-# 11. Save R objects
+# 13. Save R objects
 # ------------------------------------------------------------
 
 saveRDS(seg_fit, "Segmented_PCoA1_TSI_model.rds")
 saveRDS(bray_perm, "Bray_Curtis_distance_matrix.rds")
+saveRDS(env_fit, "envfit_model.rds")
