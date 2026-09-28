@@ -1,430 +1,285 @@
-# ============================================================
-# SPIEC-EASI network construction and site-level topology
-# Hanjiang River Basin bacterial communities
-# ============================================================
 
-library(tidyverse)
-library(phyloseq)
-library(SpiecEasi)
-library(igraph)
-library(openxlsx)
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(SpiecEasi)
+  library(igraph)
+  library(openxlsx)
+})
 
-# -----------------------------
-# 1. Load data
-# -----------------------------
-otu_raw <- read.csv("Bacteria.otu.csv",
-                    row.names = 1,
-                    check.names = FALSE)
-
-wet_env <- read.csv("wet.season.env.csv",
-                    check.names = FALSE)
-
-dry_env <- read.csv("dry.season.env.csv",
-                    check.names = FALSE)
-
-wet_env$Season <- "Wet"
-dry_env$Season <- "Dry"
-
+set.seed(10010)
+otu_raw <- read.csv('Bacteria.otu.csv', row.names = 1,
+                    check.names = FALSE, stringsAsFactors = FALSE)
+wet_env <- read.csv('wet.season.env.csv', check.names = FALSE,
+                    stringsAsFactors = FALSE)
+dry_env <- read.csv('dry.season.env.csv', check.names = FALSE,
+                    stringsAsFactors = FALSE)
+wet_env$Season <- 'Wet'
+dry_env$Season <- 'Dry'
 env <- bind_rows(wet_env, dry_env)
+if ('sites' %in% names(env) && !'SampleID' %in% names(env))
+  names(env)[names(env) == 'sites'] <- 'SampleID'
+if ('lifetype' %in% names(env) && !'LifeType' %in% names(env))
+  names(env)[names(env) == 'lifetype'] <- 'LifeType'
+if (!all(c('SampleID', 'LifeType', 'TSI', 'Season') %in% names(env)))
+  stop('Environmental tables must identify SampleID, LifeType, and TSI.')
+env$SampleID <- trimws(as.character(env$SampleID))
+lifestyle <- tolower(trimws(as.character(env$LifeType)))
+lifestyle <- gsub('[-_ ]+', '', lifestyle)
+env$LifeType <- ifelse(lifestyle %in% c('fl', 'freeliving'), 'FL',
+                       ifelse(lifestyle %in% c('pa', 'particleattached',
+                                               'paticleattached', 'particleattach'),
+                              'PA', NA_character_))
+if (anyNA(env$LifeType) || anyNA(env$SampleID) || anyDuplicated(env$SampleID))
+  stop('Resolve missing/duplicate SampleIDs or unrecognized lifestyles.')
+env$TSI <- suppressWarnings(as.numeric(env$TSI))
+if (anyNA(env$TSI)) stop('TSI must be numeric and nonmissing.')
+if (!'TrophicState' %in% names(env)) {
+  env$TrophicState <- ifelse(env$TSI <= 50, 'OMR', 'ER')
+} else {
+  state <- toupper(trimws(as.character(env$TrophicState)))
+  if (!all(state %in% c('OMR', 'ER'))) stop('TrophicState must be OMR or ER.')
+  if (any(state != ifelse(env$TSI <= 50, 'OMR', 'ER')))
+    stop('TrophicState disagrees with the TSI <= 50 rule; resolve first.')
+  env$TrophicState <- state
+}
 
-# standardize column names if needed
-env <- env %>%
-  rename(
-    SampleID = sites,
-    LifeType = lifetype
-  )
+tax_string <- if ('taxa' %in% names(otu_raw)) as.character(otu_raw$taxa) else
+  rep(NA_character_, nrow(otu_raw))
+names(tax_string) <- rownames(otu_raw)
+otu_raw$taxa <- NULL
+if (anyDuplicated(rownames(otu_raw)) || anyDuplicated(names(otu_raw)))
+  stop('OTU and sample identifiers must be unique.')
+counts <- as.matrix(otu_raw)
+suppressWarnings(storage.mode(counts) <- 'numeric')
+if (anyNA(counts) || any(counts < 0) || any(abs(counts - round(counts)) > 1e-8))
+  stop('OTU counts must be nonnegative integers without missing values.')
+missing_samples <- setdiff(env$SampleID, colnames(counts))
+if (length(missing_samples))
+  stop('Metadata SampleIDs missing from OTU table: ',
+       paste(head(missing_samples, 10), collapse = ', '))
+counts <- counts[, env$SampleID, drop = FALSE]
 
-env$LifeType <- recode(env$LifeType,
-                       "free living" = "FL",
-                       "freeliving" = "FL",
-                       "Free living" = "FL",
-                       "particle attached" = "PA",
-                       "paticle attached" = "PA",
-                       "Particle attached" = "PA",
-                       "particleattach" = "PA")
+parse_rank <- function(x, rank) {
+  if (is.na(x)) return('Unclassified')
+  pieces <- trimws(gsub('\\(.*?\\)', '', strsplit(x, ';', fixed = TRUE)[[1]]))
+  if (length(pieces) < rank || !nzchar(pieces[rank])) 'Unclassified'
+  else pieces[rank]
+}
+taxonomy <- data.frame(OTU = rownames(counts),
+                       Genus = vapply(tax_string, parse_rank, '', rank = 6),
+                       Phylum = vapply(tax_string, parse_rank, '', rank = 2),
+                       row.names = NULL)
 
-# OTU count matrix
-taxa_info <- otu_raw$taxa
-otu_mat <- otu_raw[, setdiff(colnames(otu_raw), "taxa")]
-otu_mat <- as.matrix(otu_mat)
+filter_otus <- function(m) {
+  m[rowSums(m) > 1000 & rowMeans(m > 0) >= 0.10, , drop = FALSE]
+}
 
-# -----------------------------
-# 2. Parse taxonomy
-# -----------------------------
-parse_tax <- function(x, rank = 6) {
-  z <- unlist(strsplit(as.character(x), ";"))
-  z <- gsub("\\(.*?\\)", "", z)
-  z <- trimws(z)
-  if (length(z) >= rank && z[rank] != "") {
-    return(z[rank])
-  } else {
-    return("Unclassified")
+# spiec.easi() performs the compositional/CLR transformation internally on
+# untransformed count data. Do not CLR-transform counts before passing them in.
+fit_regional <- function(m) {
+  set.seed(10010)
+  fit <- spiec.easi(t(m), method = 'mb', nlambda = 20,
+                    lambda.min.ratio = 1e-2, sel.criterion = 'stars',
+                    pulsar.params = list(thresh = 0.05, rep.num = 50,
+                                         seed = 10010))
+  adj <- as.matrix(getRefit(fit))
+  beta <- as.matrix(symBeta(getOptBeta(fit), mode = 'maxabs'))
+  if (!identical(dim(adj), c(nrow(m), nrow(m))) ||
+      !identical(dim(beta), dim(adj)))
+    stop('SPIEC-EASI output dimensions do not match retained OTUs.')
+  dimnames(adj) <- list(rownames(m), rownames(m))
+  dimnames(beta) <- dimnames(adj)
+  if (!isTRUE(all.equal(adj, t(adj))) || any(diag(adj) != 0))
+    stop('The fitted adjacency is not simple and symmetric.')
+  g <- graph_from_adjacency_matrix(adj, mode = 'undirected', diag = FALSE)
+  if (ecount(g)) {
+    ends <- ends(g, E(g), names = TRUE)
+    w <- beta[cbind(ends[, 1], ends[, 2])]
+    if (anyNA(w) || any(w == 0))
+      stop('A selected edge has a missing or zero coefficient.')
+    E(g)$weight <- as.numeric(w)
+    E(g)$sign <- ifelse(w > 0, 'positive', 'negative')
   }
+  V(g)$Genus <- taxonomy$Genus[match(V(g)$name, taxonomy$OTU)]
+  V(g)$Phylum <- taxonomy$Phylum[match(V(g)$name, taxonomy$OTU)]
+  list(graph = g, fit = fit)
 }
 
-tax_df <- data.frame(
-  OTU = rownames(otu_mat),
-  Taxa = taxa_info,
-  Phylum = sapply(taxa_info, parse_tax, rank = 2),
-  Genus = sapply(taxa_info, parse_tax, rank = 6),
-  stringsAsFactors = FALSE
-)
-
-# -----------------------------
-# 3. OTU filtering function
-# -----------------------------
-filter_otus <- function(counts,
-                        min_reads = 1000,
-                        min_prevalence = 0.10) {
-
-  keep <- rowSums(counts) > min_reads &
-    rowSums(counts > 0) / ncol(counts) >= min_prevalence
-
-  counts[keep, , drop = FALSE]
+# J = -I + W. Association coefficients are used as an operational proxy for
+# signed interactions; S is model-based local stability, not ecosystem resilience.
+calc_stability <- function(g, self_regulation = 1) {
+  n <- vcount(g)
+  if (!n) return(NA_real_)
+  W <- if (ecount(g))
+    as.matrix(as_adjacency_matrix(g, attr = 'weight', sparse = FALSE)) else
+    matrix(0, n, n)
+  J <- W - diag(self_regulation, n)
+  -max(Re(eigen(J, only.values = TRUE)$values))
 }
 
-# -----------------------------
-# 4. Robustness simulation
-# -----------------------------
-calc_robustness <- function(g,
-                            remove_fraction = 0.5,
-                            nperm = 100) {
-
-  if (vcount(g) < 5) return(NA)
-
-  robustness_values <- replicate(nperm, {
-
-    n_remove <- floor(vcount(g) * remove_fraction)
-    remove_nodes <- sample(V(g), n_remove)
-
-    g2 <- delete_vertices(g, remove_nodes)
-
-    if (vcount(g2) == 0) return(0)
-
-    comp <- components(g2)
-    max(comp$csize) / vcount(g)
-  })
-
-  mean(robustness_values, na.rm = TRUE)
+# One random removal order per repetition, evaluated at all fractions. LCC
+# retention is divided by initial N; even at f = 0 it can be < 1 if the
+# original induced subnetwork is disconnected. Disconnected nodes are not
+# deleted a second time: they simply do not contribute to the LCC.
+calc_robustness <- function(g, nrep = 1000L) {
+  N <- vcount(g)
+  if (!N) return(NA_real_)
+  fractions <- seq(0, 0.50, by = 0.01)
+  nremove <- floor(fractions * N)
+  retained <- numeric(length(fractions))
+  for (rep in seq_len(nrep)) {
+    order <- sample.int(N)
+    for (j in seq_along(fractions)) {
+      keep <- if (nremove[j] == 0) seq_len(N) else
+        order[-seq_len(nremove[j])]
+      h <- induced_subgraph(g, vids = keep)
+      retained[j] <- retained[j] +
+        if (vcount(h)) max(components(h)$csize) / N else 0
+    }
+  }
+  retained <- retained / nrep
+  auc <- sum(diff(fractions) *
+               (head(retained, -1) + tail(retained, -1)) / 2)
+  c(Robustness = auc / 0.50,
+    LCC_fraction_at_zero = retained[1])
 }
 
-# -----------------------------
-# 5. Topology metric function
-# -----------------------------
 calc_topology <- function(g) {
-
-  if (vcount(g) == 0) {
-    return(data.frame(
-      Nodes = 0,
-      Edges = 0,
-      Average_degree = NA,
-      Density = NA,
-      Clustering_coefficient = NA,
-      Degree_centralization = NA,
-      Average_path_length = NA,
-      Modularity = NA,
-      Connected_components = NA,
-      Largest_component_nodes = NA,
-      Largest_component_ratio = NA,
-      Robustness = NA
-    ))
-  }
-
+  N <- vcount(g)
+  if (!N) return(data.frame(Nodes = 0, Edges = 0,
+    Average_degree = NA_real_, Clustering_coefficient = NA_real_,
+    Modularity = NA_real_, Degree_centralization = NA_real_,
+    Average_path_length = NA_real_, Network_stability = NA_real_,
+    Robustness = NA_real_, LCC_fraction_at_zero = NA_real_))
+  E <- ecount(g)
+  # Signed weights are retained for stability, but ordinary Louvain cannot
+  # use negative weights. Topological measures here use unweighted edges.
+  communities <- if (E) cluster_louvain(g, weights = NA) else NULL
   comp <- components(g)
-
-  lcc <- induced_subgraph(
-    g,
-    vids = V(g)[comp$membership == which.max(comp$csize)]
-  )
-
-  comm <- tryCatch(
-    cluster_louvain(g),
-    error = function(e) NULL
-  )
-
-  data.frame(
-    Nodes = vcount(g),
-    Edges = ecount(g),
+  lcc <- induced_subgraph(g, which(comp$membership == which.max(comp$csize)))
+  R <- calc_robustness(g)
+  data.frame(Nodes = N, Edges = E,
     Average_degree = mean(degree(g)),
-    Density = edge_density(g, loops = FALSE),
-    Clustering_coefficient = transitivity(g,
-                                           type = "average",
-                                           isolates = "zero"),
-    Degree_centralization = centr_degree(g)$centralization,
-    Average_path_length = ifelse(vcount(lcc) > 1,
-                                 mean_distance(lcc),
-                                 NA),
-    Modularity = ifelse(is.null(comm), NA, modularity(comm)),
-    Connected_components = comp$no,
-    Largest_component_nodes = max(comp$csize),
-    Largest_component_ratio = max(comp$csize) / vcount(g),
-    Robustness = calc_robustness(g,
-                                 remove_fraction = 0.5,
-                                 nperm = 100)
-  )
+    Clustering_coefficient = if (E) transitivity(g, type = 'average',
+                                                  isolates = 'zero') else 0,
+    Modularity = if (is.null(communities)) NA_real_ else
+      modularity(g, membership(communities), weights = NA),
+    Degree_centralization = if (N > 2)
+      centr_degree(g, mode = 'all', normalized = TRUE)$centralization else 0,
+    Average_path_length = if (vcount(lcc) > 1)
+      mean_distance(lcc, directed = FALSE, weights = NA) else NA_real_,
+    Network_stability = calc_stability(g),
+    Robustness = unname(R['Robustness']),
+    LCC_fraction_at_zero = unname(R['LCC_fraction_at_zero']))
 }
 
-# -----------------------------
-# 6. Composite index function
-# -----------------------------
-z_score <- function(x) {
-  if (all(is.na(x))) return(x)
-  if (length(unique(na.omit(x))) <= 1) return(rep(0, length(x)))
-  as.numeric(scale(x))
+# Six positive z-scores and a negative path-length z-score, all divided by 7.
+# Standardization is across all sample-level subnetworks, not by subgroup.
+zscore <- function(x) {
+  s <- sd(x, na.rm = TRUE)
+  if (!is.finite(s) || s == 0) stop('Cannot standardize a network metric.')
+  (x - mean(x, na.rm = TRUE)) / s
+}
+add_complexity <- function(df) {
+  vars <- c('Nodes', 'Edges', 'Average_degree',
+            'Clustering_coefficient', 'Modularity',
+            'Degree_centralization', 'Average_path_length')
+  Z <- lapply(df[vars], zscore)
+  df$Network_complexity <- (Z$Nodes + Z$Edges + Z$Average_degree +
+    Z$Clustering_coefficient + Z$Modularity +
+    Z$Degree_centralization - Z$Average_path_length) / 7
+  df
 }
 
-add_complexity_stability <- function(df) {
-
-  df %>%
-    mutate(
-      z_Nodes = z_score(Nodes),
-      z_Edges = z_score(Edges),
-      z_Average_degree = z_score(Average_degree),
-      z_Density = z_score(Density),
-      z_Clustering = z_score(Clustering_coefficient),
-      z_Modularity = z_score(Modularity),
-      z_Robustness = z_score(Robustness),
-      z_LCC_ratio = z_score(Largest_component_ratio),
-      z_Fragmentation = z_score(-Connected_components),
-
-      Network_complexity = rowMeans(
-        select(.,
-               z_Nodes,
-               z_Edges,
-               z_Average_degree,
-               z_Density,
-               z_Clustering),
-        na.rm = TRUE
-      ),
-
-      Network_stability = rowMeans(
-        select(.,
-               z_Modularity,
-               z_Clustering,
-               z_Robustness,
-               z_LCC_ratio,
-               z_Fragmentation),
-        na.rm = TRUE
-      )
-    )
-}
-
-# -----------------------------
-# 7. SPIEC-EASI network function
-# -----------------------------
-run_spiec_network <- function(counts,
-                              method = "mb",
-                              lambda.min.ratio = 1e-2,
-                              nlambda = 20,
-                              rep.num = 1000) {
-
-  ps <- phyloseq(
-    otu_table(counts, taxa_are_rows = TRUE)
-  )
-
-  se <- spiec.easi(
-    ps,
-    method = method,
-    lambda.min.ratio = lambda.min.ratio,
-    nlambda = nlambda,
-    pulsar.params = list(rep.num = rep.num)
-  )
-
-  adj <- as.matrix(getRefit(se))
-
-  g <- graph_from_adjacency_matrix(
-    adj,
-    mode = "undirected",
-    diag = FALSE
-  )
-
-  # assign edge sign from beta matrix
-  beta <- symBeta(getOptBeta(se), mode = "maxabs")
-  edge_list <- as_edgelist(g)
-
-  if (ecount(g) > 0) {
-    E(g)$weight <- beta[edge_list]
-    E(g)$sign <- ifelse(E(g)$weight > 0,
-                         "positive",
-                         "negative")
+# Four separately inferred regional graphs. Filtering is performed *within*
+# each Season x LifeType dataset to match the four reported retained-OTU counts.
+# This should be stated explicitly in Methods; 'across overall samples' is
+# ambiguous and would describe a different filtering calculation.
+regional <- list(); fits <- list(); local_graphs <- list()
+node_tables <- list(); edge_tables <- list(); group_graphs <- list()
+rows <- list(); audit <- list()
+expected <- c(Wet_FL = 492L, Wet_PA = 576L,
+              Dry_FL = 507L, Dry_PA = 592L)
+for (season in c('Wet', 'Dry')) for (life in c('FL', 'PA')) {
+  key <- paste(season, life, sep = '_')
+  sub <- env[env$Season == season & env$LifeType == life, , drop = FALSE]
+  if (nrow(sub) < 3) stop('Too few samples in ', key)
+  m <- filter_otus(counts[, sub$SampleID, drop = FALSE])
+  message(key, ': ', nrow(m), ' retained OTUs')
+  if (nrow(m) != expected[[key]])
+    warning(key, ' retained ', nrow(m), ' OTUs; manuscript says ',
+            expected[[key]], '. Check sample inclusion/filtering before reporting.')
+  if (nrow(m) < 2) stop('Too few retained OTUs in ', key)
+  out <- fit_regional(m)
+  g <- out$graph
+  regional[[key]] <- g; fits[[key]] <- out$fit
+  node_tables[[key]] <- data.frame(OTU = V(g)$name, Genus = V(g)$Genus,
+     Phylum = V(g)$Phylum, Degree = degree(g))
+  edge_tables[[key]] <- as_data_frame(g, what = 'edges')
+  audit[[key]] <- data.frame(Group = key, Samples = nrow(sub),
+    Retained_OTUs = nrow(m), Regional_edges = ecount(g),
+    Positive_edges = sum(E(g)$sign == 'positive'),
+    Negative_edges = sum(E(g)$sign == 'negative'))
+  for (i in seq_len(nrow(sub))) {
+    sid <- sub$SampleID[i]
+    present <- rownames(m)[m[, sid] > 0]
+    gs <- induced_subgraph(g, vids = intersect(V(g)$name, present))
+    local_graphs[[sid]] <- gs
+    row <- calc_topology(gs)
+    row$SampleID <- sid; row$Season <- season; row$LifeType <- life
+    row$TSI <- sub$TSI[i]; row$TrophicState <- sub$TrophicState[i]
+    rows[[sid]] <- row
   }
-
-  V(g)$OTU <- V(g)$name
-
-  g
-}
-
-# -----------------------------
-# 8. Main workflow
-# -----------------------------
-network_list <- list()
-site_metric_list <- list()
-node_list <- list()
-edge_list <- list()
-
-group_table <- expand.grid(
-  Season = c("Wet", "Dry"),
-  LifeType = c("FL", "PA"),
-  stringsAsFactors = FALSE
-)
-
-for (i in seq_len(nrow(group_table))) {
-
-  season_i <- group_table$Season[i]
-  life_i <- group_table$LifeType[i]
-
-  message("Running: ", season_i, " | ", life_i)
-
-  env_sub <- env %>%
-    filter(Season == season_i,
-           LifeType == life_i)
-
-  sample_ids <- intersect(env_sub$SampleID, colnames(otu_mat))
-
-  counts_sub <- otu_mat[, sample_ids, drop = FALSE]
-
-  counts_filt <- filter_otus(
-    counts_sub,
-    min_reads = 1000,
-    min_prevalence = 0.10
-  )
-
-  message("Retained OTUs: ", nrow(counts_filt))
-
-  # SPIEC-EASI regional network
-  g_regional <- run_spiec_network(counts_filt)
-
-  # add taxonomy
-  V(g_regional)$Genus <- tax_df$Genus[
-    match(V(g_regional)$name, tax_df$OTU)
-  ]
-
-  V(g_regional)$Phylum <- tax_df$Phylum[
-    match(V(g_regional)$name, tax_df$OTU)
-  ]
-
-  group_name <- paste(season_i, life_i, sep = "_")
-  network_list[[group_name]] <- g_regional
-
-  # save regional node table
-  node_df <- data.frame(
-    OTU = V(g_regional)$name,
-    Genus = V(g_regional)$Genus,
-    Phylum = V(g_regional)$Phylum,
-    Degree = degree(g_regional),
-    stringsAsFactors = FALSE
-  )
-
-  node_list[[group_name]] <- node_df
-
-  # save regional edge table
-  if (ecount(g_regional) > 0) {
-    edge_df <- as_data_frame(g_regional, what = "edges")
-  } else {
-    edge_df <- data.frame()
-  }
-
-  edge_list[[group_name]] <- edge_df
-
-  # -----------------------------
-  # 9. Site-level subnetworks
-  # -----------------------------
-  for (sid in sample_ids) {
-
-    present_otus <- rownames(counts_filt)[counts_filt[, sid] > 0]
-
-    g_site <- induced_subgraph(
-      g_regional,
-      vids = intersect(V(g_regional)$name, present_otus)
-    )
-
-    topo <- calc_topology(g_site)
-
-    topo$SampleID <- sid
-    topo$Season <- season_i
-    topo$LifeType <- life_i
-    topo$TSI <- env_sub$TSI[
-      match(sid, env_sub$SampleID)
-    ]
-
-    site_metric_list[[paste(group_name, sid, sep = "_")]] <- topo
+  # These OMR/ER graphs are induced from the four regional graphs, never
+  # re-inferred independently. They are for group visualization.
+  for (state in c('OMR', 'ER')) {
+    subset_ids <- sub$SampleID[sub$TrophicState == state]
+    group_present <- rownames(m)[rowSums(m[, subset_ids, drop = FALSE] > 0) > 0]
+    group_graphs[[paste(key, state, sep = '_')]] <-
+      induced_subgraph(g, intersect(V(g)$name, group_present))
   }
 }
+site_metrics <- bind_rows(rows)
+site_metrics <- add_complexity(site_metrics)
+audit_table <- bind_rows(audit)
 
-# -----------------------------
-# 10. Combine site-level metrics
-# -----------------------------
-site_metrics <- bind_rows(site_metric_list)
+# Eight positive-association group graphs for the simplified Figure 4; only
+# five highest-degree nodes are labelled (degree measured within plotted graph).
+pdf('SPIEC_EASI_positive_group_networks.pdf', width = 14, height = 7)
+par(mfrow = c(2, 4), mar = c(2, 2, 3, 1))
+for (key in names(group_graphs)) {
+  g <- group_graphs[[key]]
+  gp <- subgraph.edges(g, E(g)[sign == 'positive'], delete.vertices = FALSE)
+  if (!ecount(gp)) { plot.new(); title(main = key); next }
+  hubs <- names(sort(degree(gp), decreasing = TRUE))[seq_len(min(5, vcount(gp)))]
+  labels <- rep(NA_character_, vcount(gp))
+  ix <- match(hubs, V(gp)$name)
+  labels[ix] <- paste0(hubs, ' (', V(gp)$Genus[ix], ')')
+  set.seed(10010)
+  coords <- layout_with_fr(gp, weights = abs(E(gp)$weight))
+  plot(gp, layout = coords, vertex.label = labels,
+       vertex.size = 2.5, vertex.color = '#367FAD',
+       vertex.label.cex = 0.5, vertex.label.color = 'black',
+       edge.width = 0.3, edge.color = adjustcolor('#4B6470', alpha.f = 0.35),
+       main = key)
+}
+dev.off()
 
-site_metrics <- add_complexity_stability(site_metrics)
-
-# -----------------------------
-# 11. Export Excel workbook
-# -----------------------------
 wb <- createWorkbook()
-
-addWorksheet(wb, "Site_network_metrics")
-writeData(wb, "Site_network_metrics", site_metrics)
-
-for (nm in names(node_list)) {
-  addWorksheet(wb, paste0(nm, "_nodes"))
-  writeData(wb, paste0(nm, "_nodes"), node_list[[nm]])
-
-  addWorksheet(wb, paste0(nm, "_edges"))
-  writeData(wb, paste0(nm, "_edges"), edge_list[[nm]])
+addWorksheet(wb, 'Site_network_metrics')
+writeData(wb, 'Site_network_metrics', site_metrics)
+addWorksheet(wb, 'Regional_audit')
+writeData(wb, 'Regional_audit', audit_table)
+for (key in names(regional)) {
+  addWorksheet(wb, paste0(key, '_nodes'))
+  writeData(wb, paste0(key, '_nodes'), node_tables[[key]])
+  addWorksheet(wb, paste0(key, '_edges'))
+  writeData(wb, paste0(key, '_edges'), edge_tables[[key]])
 }
-
-saveWorkbook(
-  wb,
-  "SPIEC_EASI_site_level_network_metrics.xlsx",
-  overwrite = TRUE
-)
-
-# -----------------------------
-# 12. GLM: TSI vs topology metrics
-# -----------------------------
-glm_data <- site_metrics %>%
-  pivot_longer(
-    cols = c(
-      Nodes,
-      Edges,
-      Average_degree,
-      Density,
-      Clustering_coefficient,
-      Degree_centralization,
-      Average_path_length,
-      Modularity,
-      Robustness,
-      Network_complexity,
-      Network_stability
-    ),
-    names_to = "Metric",
-    values_to = "Value"
-  )
-
-glm_results <- glm_data %>%
-  group_by(Season, LifeType, Metric) %>%
-  do({
-    fit <- glm(Value ~ TSI,
-               data = .,
-               family = gaussian())
-
-    data.frame(
-      Intercept = coef(fit)[1],
-      Slope_TSI = coef(fit)[2],
-      P_value = summary(fit)$coefficients[2, 4]
-    )
-  }) %>%
-  ungroup()
-
-write.csv(
-  glm_results,
-  "GLM_TSI_network_metrics.csv",
-  row.names = FALSE
-)
-
-# -----------------------------
-# 13. Save igraph objects
-# -----------------------------
-saveRDS(network_list, "SPIEC_EASI_regional_networks.rds")
-saveRDS(site_metrics, "SPIEC_EASI_site_metrics.rds")
+saveWorkbook(wb, 'SPIEC_EASI_site_level_network_metrics.xlsx', overwrite = TRUE)
+write.csv(site_metrics, 'SPIEC_EASI_site_network_metrics.csv', row.names = FALSE)
+saveRDS(regional, 'SPIEC_EASI_regional_networks.rds')
+saveRDS(group_graphs, 'SPIEC_EASI_group_subnetworks.rds')
+saveRDS(local_graphs, 'SPIEC_EASI_sample_subnetworks.rds')
+saveRDS(fits, 'SPIEC_EASI_fitted_models.rds')
+writeLines(capture.output(sessionInfo()), 'SPIEC_EASI_session_info.txt')
